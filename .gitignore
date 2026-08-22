@@ -1,0 +1,13 @@
+.env
+*.env
+__pycache__/
+*.py[cod]
+dist/
+build/
+*.spec
+logs/*.log
+logs/*.csv
+*.json
+.vscode/
+.idea/
+.DS_Store
