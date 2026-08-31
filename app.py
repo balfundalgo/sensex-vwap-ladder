@@ -1,28 +1,36 @@
 """
-SENSEX VWAP Reclaim + ATR Ladder — GUI Application v1.0
+SENSEX VWAP Reclaim + ATR Ladder — GUI Application v1.1
 ════════════════════════════════════════════════════════
 Two legs (CE + PE) of one strike | Light Theme
+
+v1.1 adds the RECONCILE panel: every closed 2-minute candle with its per-bar
+volume, VWAP and ATR — live during the session, or pulled from history on
+demand with no engine and no market hours. Diff against Kite without leaving
+the app.
+
 Balfund Trading Pvt Ltd
 """
 
-import os, sys, logging, threading
+import os, sys, csv, logging, threading
 from datetime import datetime
 from pathlib import Path
 
 import customtkinter as ctk
 from dotenv import load_dotenv, set_key
 
+import engine as E
 from engine import (
     SensexVWAPLadderEngine, StrategyConfig,
     init_credentials, set_credentials, now_ist, ENV_FILE
 )
+from indicators import compute_series
 
 if getattr(sys, 'frozen', False):
     _APP_DIR = Path(sys.executable).parent
 else:
     _APP_DIR = Path(__file__).parent if "__file__" in globals() else Path.cwd()
 
-LOG_DIR = str(_APP_DIR / "logs"); os.makedirs(LOG_DIR, exist_ok=True)
+LOG_DIR = _APP_DIR / "logs"; LOG_DIR.mkdir(exist_ok=True)
 log = logging.getLogger("SNX_GUI")
 
 ctk.set_appearance_mode("light"); ctk.set_default_color_theme("blue")
@@ -35,19 +43,23 @@ FB = ("Segoe UI", 28, "bold"); FC = ("Segoe UI", 15, "bold"); FT2 = ("Segoe UI",
 
 STATE_COLORS = {"IDLE": DIM, "ARMED": AMB, "IN_TRADE": GRN,
                 "STOOD_DOWN": RED, "HALTED": RED}
+FMONO = ("Consolas", 11)
+CANDLE_HEADER = (f"{'time':>6} {'open':>9} {'high':>9} {'low':>9} {'close':>9} "
+                 f"{'volume':>10} {'VWAP':>9} {'ATR':>8} {'above?':>7}")
 
 
 class SensexApp(ctk.CTk):
-    VERSION = "1.0"
+    VERSION = "1.1"
 
     def __init__(self):
         super().__init__()
         load_dotenv(str(ENV_FILE), override=True)
         self.title(f"SENSEX VWAP Ladder v{self.VERSION} — Balfund Trading")
-        self.geometry("1500x940"); self.minsize(1260, 800)
+        self.geometry("1560x980"); self.minsize(1280, 820)
         self.configure(fg_color=BG)
         self.engine = None; self.is_running = False
         self._saved_config = None
+        self.candle_rows = []          # everything shown in the reconcile panel
         self._build_ui(); self._load_env(); self._tick()
 
     # ═══════════ LAYOUT ═══════════
@@ -72,7 +84,7 @@ class SensexApp(ctk.CTk):
         self.left = ctk.CTkScrollableFrame(body, fg_color=CARD, width=300,
                                            corner_radius=8, border_width=1, border_color=BD)
         self.left.pack(side="left", fill="y", padx=(0, 4))
-        self.center = ctk.CTkScrollableFrame(body, fg_color=BG)
+        self.center = ctk.CTkFrame(body, fg_color=BG)
         self.center.pack(side="left", fill="both", expand=True, padx=4)
         self.right = ctk.CTkFrame(body, fg_color=CARD, width=360, corner_radius=8,
                                   border_width=1, border_color=BD)
@@ -122,12 +134,33 @@ class SensexApp(ctk.CTk):
         self.ent_lots = self._gentry(g, "Lots", "3", 2)
         self.ent_slip = self._gentry(g, "Max slip ₹", "0", 3)
 
+        self._sec(p, "📐 STUDIES  (must match his chart)")
+        f = ctk.CTkFrame(p, fg_color="transparent"); f.pack(fill="x", padx=14, pady=3)
+        ctk.CTkLabel(f, text="VWAP field", font=FM, text_color=TXT, width=100,
+                     anchor="w").pack(side="left")
+        self.opt_field = ctk.CTkOptionMenu(f, values=["ohlc4", "hlc3", "hl2", "close"],
+                                           font=FS, width=100, height=26,
+                                           fg_color=ACC, button_color=ACC)
+        self.opt_field.set("ohlc4"); self.opt_field.pack(side="left")
+        f = ctk.CTkFrame(p, fg_color="transparent"); f.pack(fill="x", padx=14, pady=3)
+        ctk.CTkLabel(f, text="ATR method", font=FM, text_color=TXT, width=100,
+                     anchor="w").pack(side="left")
+        self.opt_atrm = ctk.CTkOptionMenu(f, values=["wilder", "sma"], font=FS,
+                                          width=100, height=26, fg_color=ACC,
+                                          button_color=ACC)
+        self.opt_atrm.set("wilder"); self.opt_atrm.pack(side="left")
+        ctk.CTkLabel(p, text="ATR runs continuously across sessions. Use the "
+                             "RECONCILE panel to check both against Kite before "
+                             "trusting them.",
+                     font=FT2, text_color=DIM, wraplength=250, justify="left"
+                     ).pack(anchor="w", padx=14, pady=(2, 0))
+
         self._sec(p, "🪜 LADDER")
         g = ctk.CTkFrame(p, fg_color="transparent"); g.pack(fill="x", padx=14, pady=2)
         self.ent_atrp = self._gentry(g, "ATR period", "14", 0)
         self.ent_mult = self._gentry(g, "ATR per rung", "2.0", 1)
         self.ent_cost = self._gentry(g, "T1 stop = E+", "2.00", 2)
-        self.ent_seed = self._gentry(g, "ATR seed bars", "100", 3)
+        self.ent_seed = self._gentry(g, "ATR seed bars", "300", 3)
 
         self._sec(p, "⏰ TIMING")
         g = ctk.CTkFrame(p, fg_color="transparent"); g.pack(fill="x", padx=14, pady=2)
@@ -188,26 +221,7 @@ class SensexApp(ctk.CTk):
         for name in ["CE", "PE"]:
             self.leg_cards[name] = self._leg_card(legs_row, name)
 
-        self._sec(c, "🕯 LAST CLOSED CANDLE")
-        self.cand_frame = ctk.CTkFrame(c, fg_color=CARD, corner_radius=8,
-                                       border_width=1, border_color=BD)
-        self.cand_frame.pack(fill="x", pady=2)
-        hdr = ctk.CTkFrame(self.cand_frame, fg_color="#e8ecf1"); hdr.pack(fill="x")
-        for col, w in [("Leg", 45), ("Time", 55), ("Open", 70), ("High", 70),
-                       ("Low", 70), ("Close", 70), ("VWAP", 70), ("ATR", 60),
-                       ("State", 90)]:
-            ctk.CTkLabel(hdr, text=col, font=("Segoe UI", 10, "bold"), text_color=TXT,
-                         width=w, anchor="w").pack(side="left", padx=3, pady=3)
-        self.cand_rows = {}
-        for name in ["CE", "PE"]:
-            r = ctk.CTkFrame(self.cand_frame, fg_color="transparent"); r.pack(fill="x")
-            lbls = {}
-            for k, w in [("leg", 45), ("t", 55), ("o", 70), ("h", 70), ("l", 70),
-                         ("c", 70), ("v", 70), ("a", 60), ("s", 90)]:
-                lb = ctk.CTkLabel(r, text="—", font=FL, text_color=TXT, width=w, anchor="w")
-                lb.pack(side="left", padx=3, pady=2); lbls[k] = lb
-            lbls["leg"].configure(text=name)
-            self.cand_rows[name] = lbls
+        self._build_reconcile(c)
 
     def _info(self, parent, label, value):
         f = ctk.CTkFrame(parent, fg_color="transparent")
@@ -243,6 +257,206 @@ class SensexApp(ctk.CTk):
         elig = ctk.CTkLabel(cd, text="eligible", font=FT2, text_color=GRN)
         elig.pack(pady=(0, 6))
         return {"frame": cd, "state": st, "pnl": pnl, "cells": cells, "elig": elig}
+
+    # ═══════════ RECONCILE PANEL ═══════════
+    def _build_reconcile(self, c):
+        wrap = ctk.CTkFrame(c, fg_color=CARD, corner_radius=8, border_width=1,
+                            border_color=BD)
+        wrap.pack(fill="both", expand=True, pady=(4, 4))
+
+        bar = ctk.CTkFrame(wrap, fg_color="transparent")
+        bar.pack(fill="x", padx=10, pady=(8, 4))
+        ctk.CTkLabel(bar, text="🔍 RECONCILE — candles, VWAP & ATR vs Kite",
+                     font=FH, text_color=ACC).pack(side="left")
+        self.lbl_recon = ctk.CTkLabel(bar, text="", font=FT2, text_color=DIM)
+        self.lbl_recon.pack(side="left", padx=12)
+
+        ctk.CTkButton(bar, text="Export CSV", font=FL, width=88, height=28,
+                      fg_color="#e5e7eb", text_color=TXT, hover_color="#d1d5db",
+                      command=self._export_csv).pack(side="right", padx=3)
+        ctk.CTkButton(bar, text="Clear", font=FL, width=58, height=28,
+                      fg_color="#e5e7eb", text_color=TXT, hover_color="#d1d5db",
+                      command=self._clear_candles).pack(side="right", padx=3)
+        self.btn_recon = ctk.CTkButton(bar, text="⟳  LOAD FROM HISTORY", font=FM,
+                                       width=176, height=28, fg_color=ACC,
+                                       hover_color="#025a8c", text_color="white",
+                                       command=self._on_reconcile)
+        self.btn_recon.pack(side="right", padx=3)
+        self.ent_recon_strike = ctk.CTkEntry(bar, font=FS, width=78, height=28,
+                                             fg_color="#fafbfc", border_color=BD,
+                                             text_color=TXT, placeholder_text="strike")
+        self.ent_recon_strike.pack(side="right", padx=3)
+        self.opt_recon_leg = ctk.CTkOptionMenu(bar, values=["BOTH", "CE", "PE"],
+                                               font=FS, width=78, height=28,
+                                               fg_color=ACC, button_color=ACC,
+                                               text_color="white")
+        self.opt_recon_leg.set("BOTH"); self.opt_recon_leg.pack(side="right", padx=3)
+
+        self.candle_box = ctk.CTkTextbox(wrap, fg_color="#fafbfc", font=FMONO,
+                                         text_color=TXT, border_width=1,
+                                         border_color=BD, corner_radius=4,
+                                         wrap="none", state="disabled")
+        self.candle_box.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self._write_candles(
+            "Closed 2-minute candles appear here live once the engine is running.\n"
+            "Or press LOAD FROM HISTORY to pull today's bars right now — no engine,\n"
+            "no market hours needed — and compare them against the chart.\n\n"
+            "Check in this order:  timestamps -> volume -> VWAP -> ATR.\n"
+            "The 09:15 ATR is the one the overnight gap moves, so start there.\n")
+
+    def _write_candles(self, text, clear=False):
+        self.candle_box.configure(state="normal")
+        if clear:
+            self.candle_box.delete("1.0", "end")
+        self.candle_box.insert("end", text)
+        self.candle_box.see("end")
+        self.candle_box.configure(state="disabled")
+
+    def _clear_candles(self):
+        self.candle_rows = []
+        self._write_candles("", clear=True)
+        self.lbl_recon.configure(text="")
+
+    def _fmt_row(self, leg, t, o, h, l, c, vol, vwap, atr):
+        above = ""
+        if vwap is not None:
+            above = "YES" if c > vwap else ("=" if c == vwap else "no")
+        return (f"{leg:<4}{t:>6} {o:>9.2f} {h:>9.2f} {l:>9.2f} {c:>9.2f} "
+                f"{vol:>10.0f} {('%.2f' % vwap) if vwap is not None else '-':>9} "
+                f"{('%.2f' % atr) if atr is not None else '-':>8} {above:>7}\n")
+
+    def _append_candle(self, d):
+        """A candle just closed on the live feed."""
+        self._write_candles(self._fmt_row(
+            d.get("leg", ""), d.get("time", ""), d.get("open", 0), d.get("high", 0),
+            d.get("low", 0), d.get("close", 0), d.get("volume", 0),
+            d.get("vwap"), d.get("atr")))
+        self.candle_rows.append({
+            "leg": d.get("leg"), "time": d.get("time"), "open": d.get("open"),
+            "high": d.get("high"), "low": d.get("low"), "close": d.get("close"),
+            "volume": d.get("volume"), "vwap": d.get("vwap"), "atr": d.get("atr"),
+            "source": "live"})
+        self.lbl_recon.configure(text=f"{len(self.candle_rows)} bars (live)")
+
+    def _export_csv(self):
+        if not self.candle_rows:
+            self._log("Nothing to export yet"); return
+        path = LOG_DIR / f"reconcile_{now_ist().strftime('%Y%m%d_%H%M%S')}.csv"
+        try:
+            with open(path, "w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=list(self.candle_rows[0].keys()))
+                w.writeheader(); w.writerows(self.candle_rows)
+            self._log(f"Exported {len(self.candle_rows)} rows -> {path.name}")
+        except Exception as ex:
+            self._log(f"ERROR Export failed: {ex}")
+
+    def _on_reconcile(self):
+        cid = self.ent_cid.get().strip(); pin = self.ent_pin.get().strip()
+        totp = self.ent_totp.get().strip()
+        if not cid or not pin or not totp:
+            self._log("ERROR Fill credentials before loading history"); return
+        self.btn_recon.configure(state="disabled", text="Loading...")
+        threading.Thread(target=self._reconcile_worker,
+                         args=(cid, pin, totp), daemon=True).start()
+
+    def _reconcile_worker(self, cid, pin, totp):
+        ui = lambda fn, *a: self.after(0, fn, *a)
+        try:
+            if not E.HEADERS.get("access-token"):
+                set_credentials(cid, pin, totp, os.getenv("DHAN_ACCESS_TOKEN", ""))
+                ui(self._log, "Authenticating for reconcile...")
+                init_credentials()
+
+            field = self.opt_field.get()
+            method = self.opt_atrm.get()
+            period = self._i(self.ent_atrp, 14)
+
+            expiry = E.get_nearest_expiry()
+            if not expiry:
+                ui(self._log, "ERROR No expiry found"); return
+
+            txt = self.ent_recon_strike.get().strip()
+            if txt.isdigit():
+                strike = int(txt)
+            else:
+                idx_open = E.get_sensex_open_0915()
+                if not idx_open:
+                    ui(self._log, "ERROR Could not read the 09:15 index open"); return
+                strike = int(round(idx_open / 100.0) * 100)
+                ui(self._log, f"09:15 open {idx_open:.2f} -> strike {strike}")
+
+            oc = E.fetch_option_chain(expiry)
+            if not oc:
+                ui(self._log, "ERROR Option chain unavailable"); return
+
+            legs = {}
+            for sk, sd in oc["oc"].items():
+                try:
+                    if abs(float(sk) - strike) > 0.01:
+                        continue
+                except ValueError:
+                    continue
+                for side, key in (("CE", "ce"), ("PE", "pe")):
+                    if key in sd:
+                        legs[side] = str(sd[key]["security_id"])
+
+            sel = self.opt_recon_leg.get()
+            wanted = ["CE", "PE"] if sel == "BOTH" else [sel]
+            anchor = E.session_anchor_epoch()
+
+            ui(self._clear_candles)
+            total = 0
+            for side in wanted:
+                sec = legs.get(side)
+                if not sec:
+                    ui(self._write_candles, f"\n{side}: strike {strike} not listed\n")
+                    continue
+
+                raw = E.fetch_intraday_1m(sec, E.SENSEX["segment"], "OPTIDX", days=10)
+                c2 = E.aggregate_2m(raw)
+                prior = [c for c in c2 if c["ts"] < anchor]
+                rows = compute_series(c2, anchor, field, period, method)
+                sess = [r for r in rows if r["ts"] >= anchor]
+
+                resid = (1 - 1 / period) ** len(prior) if prior else 1.0
+                gaps = [i for i in range(1, len(sess))
+                        if sess[i]["ts"] - sess[i - 1]["ts"] != 120]
+
+                hdr = (f"\n{'='*98}\n"
+                       f"SENSEX {strike} {side}   secId={sec}   expiry={expiry}\n"
+                       f"VWAP field={field}   ATR({period},{method}) continuous\n"
+                       f"Warm-up {len(prior)} prior bars, seed influence {resid:.2e} "
+                       f"{'(converged)' if resid < 1e-4 else '(NOT CONVERGED)'}\n"
+                       f"Session bars {len(sess)}")
+                if sess and sess[0]["atr"] is not None:
+                    hdr += f"   ATR at 09:15 = {sess[0]['atr']:.2f}"
+                hdr += "\n"
+                if gaps:
+                    hdr += (f"** {len(gaps)} gap(s): bars with no trades are absent from "
+                            f"the feed. ATR is bar-count sensitive, so check whether the "
+                            f"chart draws them. First at "
+                            f"{E.epoch_to_ist(sess[gaps[0]]['ts'], '%H:%M')}\n")
+                hdr += f"{'-'*98}\n{'leg':<4}{CANDLE_HEADER}\n{'-'*98}\n"
+                ui(self._write_candles, hdr)
+
+                for r in sess:
+                    ui(self._write_candles, self._fmt_row(
+                        side, E.epoch_to_ist(r["ts"], "%H:%M"), r["open"], r["high"],
+                        r["low"], r["close"], r.get("volume", 0), r["vwap"], r["atr"]))
+                    self.candle_rows.append({
+                        "leg": side, "time": E.epoch_to_ist(r["ts"], "%H:%M"),
+                        "open": r["open"], "high": r["high"], "low": r["low"],
+                        "close": r["close"], "volume": r.get("volume", 0),
+                        "vwap": r["vwap"], "atr": r["atr"], "source": "history"})
+                total += len(sess)
+
+            ui(lambda: self.lbl_recon.configure(text=f"{total} bars (history)"))
+            ui(self._log, f"Reconcile loaded {total} bars for {strike}")
+        except Exception as ex:
+            ui(self._log, f"ERROR Reconcile failed: {ex}")
+        finally:
+            ui(lambda: self.btn_recon.configure(state="normal",
+                                                text="⟳  LOAD FROM HISTORY"))
 
     # ═══════════ TRADE LOG ═══════════
     def _build_trade_log(self):
@@ -294,6 +508,8 @@ class SensexApp(ctk.CTk):
             self.lbl_ws.configure(text=f"WS ● {d.get('instruments',0)}", text_color=GRN)
             self.lbl_status.configure(text="● LIVE", text_color=GRN)
             self._log(f"WS connected — {d.get('instruments',0)} instruments")
+            self._clear_candles()
+            self._write_candles(f"{'leg':<4}{CANDLE_HEADER}\n{'-'*98}\n")
         elif ev == "ws_disconnected":
             self.lbl_ws.configure(text="WS ✗", text_color=RED)
         elif ev == "strike":
@@ -302,20 +518,14 @@ class SensexApp(ctk.CTk):
             self.lbl_lot.configure(text=str(d.get("lot_size", "—")))
             self._log(f"09:15 open {d.get('open',0):.2f} → strike {d.get('strike')} "
                       f"| exp {d.get('expiry')} | lot {d.get('lot_size')}")
+        elif ev == "seeded":
+            note = "converged" if d.get("residual", 1) < 1e-4 else "NOT CONVERGED"
+            self._log(f"[{d.get('leg')}] ATR seeded {d.get('bars')} bars → "
+                      f"{d.get('atr', 0):.2f}  ({note})")
         elif ev == "spot_tick":
             self.lbl_spot.configure(text=f"{d.get('spot',0):.2f}")
         elif ev == "candle":
-            leg = d.get("leg")
-            if leg in self.cand_rows:
-                r = self.cand_rows[leg]
-                r["t"].configure(text=d.get("time", "—"))
-                for k, key in [("o", "open"), ("h", "high"), ("l", "low"), ("c", "close")]:
-                    r[k].configure(text=f"{d.get(key,0):.2f}")
-                v = d.get("vwap"); a = d.get("atr")
-                r["v"].configure(text=f"{v:.2f}" if v else "…")
-                r["a"].configure(text=f"{a:.2f}" if a else "…")
-                st = d.get("state", "")
-                r["s"].configure(text=st, text_color=STATE_COLORS.get(st, TXT))
+            self._append_candle(d)
         elif ev == "armed":
             self._log(f"🎯 [{d.get('leg')}] ARMED trigger=₹{d.get('trigger',0):.2f} "
                       f"stop=₹{d.get('stop',0):.2f} ATR={d.get('atr',0):.2f} "
@@ -400,6 +610,8 @@ class SensexApp(ctk.CTk):
             entry_buffer=self._f(self.ent_buf, 0.20),
             stop_buffer=self._f(self.ent_sl, 1.00),
             atr_period=self._i(self.ent_atrp, 14),
+            vwap_field=self.opt_field.get(),
+            atr_method=self.opt_atrm.get(),
             rung_atr_mult=self._f(self.ent_mult, 2.0),
             cost_plus=self._f(self.ent_cost, 2.00),
             lots=self._i(self.ent_lots, 3),

@@ -27,6 +27,61 @@ REPEAT   ONE attempt per trip above VWAP, per leg.
 TIME     first signal 09:17 | last trigger 14:45 | flat by 15:00
 ```
 
+## Indicators — matched to ChartIQ
+
+Kite renders with ChartIQ, so [ChartIQ's Built-in Studies Reference Guide](https://documentation.chartiq.com/tutorial-Using%20and%20Customizing%20Studies%20-%20Definitions.html)
+is the reference implementation. `indicators.py` implements it directly and is
+shared by the live engine, the replay path and `reconcile.py`, so all three
+agree by construction.
+
+```
+VWAP   cumulative(field(i) * volume(i)) / cumulative(volume(i))   reset 09:15
+       field = ohlc4 (client's setting). ChartIQ's own default is hlc3.
+       volume(i) is THAT BAR's volume, never a running day total.
+
+TR     max(High, Close[-1]) - min(Low, Close[-1])
+ATR    ATR(i) = (ATR(i-1)*(N-1) + TR(i)) / N        Wilder, continuous
+```
+
+Wilder ATR has infinite memory, and ChartIQ notes its studies use however much
+history the chart has loaded. The seed's influence decays as (1-1/N)^bars, so
+N=14 needs ~200 prior bars before the starting point stops mattering. We seed
+with 300 and log the residual at start-up; if it is above 1e-4 the ATR will not
+match the terminal and the log says so.
+
+## Reconciling against the terminal — in the app
+
+The **RECONCILE** panel at the bottom of the window shows every closed 2-minute
+candle with its per-bar volume, VWAP, ATR and whether the close was above the
+line. Two ways to fill it:
+
+* **Live** — start the engine; rows append as each candle closes.
+* **LOAD FROM HISTORY** — pulls today's bars on demand. No engine, no market
+  hours. Leave the strike box empty for today's opening strike, or type one in
+  to check a past day's strike such as 77400.
+
+The header reports the ATR warm-up length, the seed convergence residual, the
+09:15 ATR, and any gaps where the feed has no bar. **Export CSV** writes
+everything to `logs/reconcile_*.csv`.
+
+Change **VWAP field** or **ATR method** in the left panel and press LOAD again
+to re-run instantly — that is how you settle ohlc4-vs-hlc3 or wilder-vs-sma.
+
+Check in this order: timestamps line up, then per-bar volume, then VWAP, then
+ATR (09:15 value first — that is the one the overnight gap moves).
+
+`reconcile.py` does the same thing headlessly for scripting; the GUI panel is
+the primary tool.
+
+## Tests
+
+```bash
+python test_indicators.py    # ChartIQ formulas, hand-computed
+python test_logic.py         # strategy state machine
+python test_gui.py           # GUI + reconcile panel (needs a display;
+                             # on Linux: xvfb-run -a python test_gui.py)
+```
+
 ## Two things that are easy to get wrong
 
 **Candles are anchored to 09:15, not to `epoch % 120`.** 09:15 IST is not on a

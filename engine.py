@@ -31,6 +31,11 @@ import pyotp
 import websocket
 from dotenv import load_dotenv, set_key
 
+# Indicators live in their own module so that the live engine, the replay path
+# and reconcile.py are guaranteed to compute identically. See indicators.py for
+# the ChartIQ definitions these implement.
+from indicators import SessionVWAP, WilderATR, price_field, true_range
+
 # ═══════════════════════════════════════════════════════════════════════════
 # PATHS
 # ═══════════════════════════════════════════════════════════════════════════
@@ -585,13 +590,18 @@ def parse_quote(payload):
 # ═══════════════════════════════════════════════════════════════════════════
 
 class CandleEngine:
-    def __init__(self, sec_id, label, interval=120, on_close=None):
+    def __init__(self, sec_id, label, interval=120, on_close=None,
+                 opening_cum_vol: float = 0.0):
         self.sec_id = sec_id; self.label = label; self.interval = interval
         self.on_close = on_close
         self.lock = threading.Lock()
         self.current: Optional[dict] = None
         self.last_ltp: Optional[float] = None
-        self.last_cum_vol: float = 0.0
+        self.last_cum_vol: float = float(opening_cum_vol)
+        # Cumulative day volume as at the close of the previous completed bar.
+        # This is the ONLY place cumulative-vs-per-bar volume is reconciled;
+        # every candle leaving this class carries a per-bar "volume".
+        self._cum_at_prev_close: float = float(opening_cum_vol)
         self.ticks = 0
 
     def on_tick(self, ltp, ltt, cum_vol=None):
@@ -614,6 +624,9 @@ class CandleEngine:
                 return
             if b > self.current["ts"]:
                 completed = dict(self.current)
+                completed["volume"] = max(
+                    0.0, completed["cum_vol"] - self._cum_at_prev_close)
+                self._cum_at_prev_close = completed["cum_vol"]
                 self.current = {"ts": b, "open": ltp, "high": ltp, "low": ltp,
                                 "close": ltp, "cum_vol": self.last_cum_vol}
         if completed is not None and self.on_close:
@@ -623,86 +636,6 @@ class CandleEngine:
 # ═══════════════════════════════════════════════════════════════════════════
 # INDICATORS
 # ═══════════════════════════════════════════════════════════════════════════
-
-class SessionVWAP:
-    """
-    Volume-weighted average price using the OHLC4 typical price, accumulated
-    from 09:15 and reset every session (spec 3).
-
-        VWAP = sum(OHLC4_i * vol_i) / sum(vol_i)
-
-    Per-candle volume is derived from the cumulative day volume in the quote
-    packet: vol_i = cum_vol(close of i) - cum_vol(close of i-1).
-    """
-
-    def __init__(self):
-        self.pv = 0.0
-        self.vol = 0.0
-        self.value: Optional[float] = None
-        self._prev_cum = None
-
-    def update(self, o, h, l, c, cum_vol) -> Optional[float]:
-        if self._prev_cum is None:
-            candle_vol = max(0.0, float(cum_vol))
-        else:
-            candle_vol = max(0.0, float(cum_vol) - self._prev_cum)
-        self._prev_cum = float(cum_vol)
-        if candle_vol <= 0:
-            return self.value          # zero-volume candle: carry forward (edge case 6)
-        typ = (o + h + l + c) / 4.0
-        self.pv += typ * candle_vol
-        self.vol += candle_vol
-        self.value = self.pv / self.vol if self.vol > 0 else None
-        return self.value
-
-    @property
-    def last_candle_vol(self):
-        return self._prev_cum
-
-
-class WilderATR:
-    """
-    ATR(14), Wilder smoothing, on a CONTINUOUS cross-session series.
-
-    Confirmed with the client: ATR does NOT reset at 09:15. It is seeded from
-    the previous session's candles so a valid reading exists on the very first
-    candle of the day. The consequence is that the 09:15 candle's true range
-    includes the overnight gap, which inflates ATR for roughly 14 candles.
-    This matches the broker's chart exactly, which is the stated priority.
-    """
-
-    def __init__(self, period=14):
-        self.period = period
-        self.prev_close: Optional[float] = None
-        self._tr_buf: List[float] = []
-        self.value: Optional[float] = None
-        self.bars = 0
-        self.seeded_bars = 0
-
-    def _tr(self, h, l, c_prev):
-        if c_prev is None:
-            return h - l
-        return max(h - l, abs(h - c_prev), abs(l - c_prev))
-
-    def update(self, h, l, c) -> Optional[float]:
-        tr = self._tr(h, l, self.prev_close)
-        self.prev_close = c
-        self.bars += 1
-        if self.value is None:
-            self._tr_buf.append(tr)
-            if len(self._tr_buf) >= self.period:
-                self.value = sum(self._tr_buf) / len(self._tr_buf)
-        else:
-            self.value = (self.value * (self.period - 1) + tr) / self.period
-        return self.value
-
-    def seed(self, candles: List[dict]):
-        for c in candles:
-            self.update(c["high"], c["low"], c["close"])
-        self.seeded_bars = self.bars
-        log.info(f"    ATR seeded from {self.seeded_bars} candles -> "
-                 f"{self.value:.2f}" if self.value else "    ATR seed incomplete")
-
 
 # ═══════════════════════════════════════════════════════════════════════════
 # CONFIG & STATE
@@ -722,12 +655,14 @@ class StrategyConfig:
     entry_buffer: float = 0.20        # above signal candle high
     stop_buffer: float = 1.00         # below signal candle low
     atr_period: int = 14
+    vwap_field: str = "ohlc4"         # must match the label on his chart
+    atr_method: str = "wilder"        # "wilder" (ChartIQ Math) | "sma"
     rung_atr_mult: float = 2.0        # Tn = E + 2*ATR*n
     cost_plus: float = 2.00           # stop after T1 = E + 2
     lots: int = 3
     last_entry: str = "14:45"
     square_off: str = "15:00"
-    atr_seed_bars: int = 100          # min prior candles for Wilder convergence
+    atr_seed_bars: int = 300          # Wilder needs ~200 bars to converge
     min_premium: float = 0.0          # 0 = disabled (open item)
     daily_loss_limit: float = 0.0     # 0 = disabled (open item)
     first_candle_can_signal: bool = True   # open item — spec 12.3 item 5
@@ -767,6 +702,8 @@ class Leg:
     eligible: bool = True
     vwap: SessionVWAP = field(default_factory=SessionVWAP)
     atr: WilderATR = field(default_factory=WilderATR)
+    seed_bars: int = 0
+    seed_residual: float = 1.0
     ltp: float = 0.0
     last_candle: Optional[dict] = None
     signal_candle: Optional[dict] = None
@@ -890,25 +827,39 @@ class SensexVWAPLadderEngine:
 
     def _seed_leg(self, leg: Leg):
         """Seed the continuous ATR from prior-session candles (spec 3.1)."""
-        log.info(f"  Seeding ATR: {leg.label}...")
-        raw = fetch_intraday_1m(leg.sec_id, SENSEX["segment"], "OPTIDX", days=6)
+        log.info(f"  Seeding indicators: {leg.label}...")
+        raw = fetch_intraday_1m(leg.sec_id, SENSEX["segment"], "OPTIDX", days=10)
         c2 = aggregate_2m(raw)
 
         anchor = session_anchor_epoch()
         prior = [c for c in c2 if c["ts"] < anchor]
         today = [c for c in c2 if c["ts"] >= anchor]
 
+        leg.vwap = SessionVWAP(self.config.vwap_field)
+        leg.atr = WilderATR(self.config.atr_period, self.config.atr_method)
+
         if len(prior) < self.config.atr_seed_bars:
             log.warning(f"  [{leg.label}] Only {len(prior)} prior candles "
-                        f"(need {self.config.atr_seed_bars}). ATR cannot be matched "
-                        f"to the broker's chart — this leg will wait for a "
-                        f"session-only ATR before trading (edge case 6b).")
-            leg.atr = WilderATR(self.config.atr_period)
+                        f"(need {self.config.atr_seed_bars}). Wilder ATR has "
+                        f"infinite memory, so a short seed will NOT match the "
+                        f"terminal. Falling back to a session-only ATR; this leg "
+                        f"waits for 14 candles before trading (edge case 6b).")
             leg.atr_ok = False
         else:
-            leg.atr = WilderATR(self.config.atr_period)
-            leg.atr.seed(prior[-max(self.config.atr_seed_bars, 200):])
+            leg.atr.seed(prior)          # feed everything we have
+            leg.seed_bars = leg.atr.bars
+            leg.seed_residual = leg.atr.convergence_error()
             leg.atr_ok = leg.atr.value is not None
+            note = "converged" if leg.seed_residual < 1e-4 else "NOT CONVERGED"
+            log.info(f"    ATR seeded from {leg.seed_bars} prior bars -> "
+                     f"{leg.atr.value:.2f} | seed influence "
+                     f"{leg.seed_residual:.2e} ({note})")
+            self._emit("seeded", {"leg": leg.name, "bars": leg.seed_bars,
+                                  "atr": leg.atr.value,
+                                  "residual": leg.seed_residual})
+            if leg.seed_residual >= 1e-4:
+                log.warning(f"    [{leg.label}] Seed has not converged — ATR may "
+                            f"disagree with the terminal. Pull more history.")
 
         # Replay any candles already elapsed today so VWAP and state are correct
         # when the engine is started mid-session.
@@ -944,9 +895,13 @@ class SensexVWAPLadderEngine:
           4. eligibility reset / new signal
         """
         o, h, l, cl = c["open"], c["high"], c["low"], c["close"]
-        cum_vol = c.get("cum_vol", c.get("volume", 0.0))
+        # "volume" is ALWAYS this bar's own traded volume — historical candles
+        # arrive that way from the API, and CandleEngine converts the live
+        # cumulative day total before emitting. Feeding a running total in here
+        # is what produced the VWAP mismatch against the terminal.
+        bar_vol = float(c.get("volume", 0.0))
 
-        vwap = leg.vwap.update(o, h, l, cl, cum_vol)
+        vwap = leg.vwap.update(o, h, l, cl, bar_vol)
         atr = leg.atr.update(h, l, cl)
         leg.last_candle = c
         leg.candles_seen += 1
@@ -960,12 +915,14 @@ class SensexVWAPLadderEngine:
             candle_logger.log(date=now_ist().strftime("%Y-%m-%d"), time=tstr,
                               leg=leg.name, sec_id=leg.sec_id, open=f"{o:.2f}",
                               high=f"{h:.2f}", low=f"{l:.2f}", close=f"{cl:.2f}",
-                              cum_vol=f"{cum_vol:.0f}",
+                              candle_vol=f"{bar_vol:.0f}",
+                              cum_vol=f"{c.get('cum_vol', 0):.0f}",
                               vwap=f"{vwap:.2f}" if vwap else "",
                               atr=f"{atr:.2f}" if atr else "",
                               state=leg.state.value, eligible=leg.eligible)
             self._emit("candle", {"leg": leg.name, "time": tstr, "open": o, "high": h,
-                                  "low": l, "close": cl, "vwap": vwap, "atr": atr,
+                                  "low": l, "close": cl, "volume": bar_vol,
+                                  "vwap": vwap, "atr": atr,
                                   "state": leg.state.value, "eligible": leg.eligible})
 
         if vwap is None:

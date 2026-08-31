@@ -35,15 +35,31 @@ def new_engine(**kw):
     return e, leg
 
 
-def candle(i, o, h, l, c, cum_vol):
+def candle(i, o, h, l, c, vol):
+    """`vol` is this bar's own traded volume (post-fix convention)."""
     return {"ts": ANCHOR + i * 120, "open": o, "high": h, "low": l,
-            "close": c, "cum_vol": cum_vol}
+            "close": c, "volume": vol, "cum_vol": 0}
+
+
+class FrozenATR(WilderATR):
+    """Fixed ATR so the expected ladder levels are exact."""
+    __slots__ = ("_fixed",)
+
+    def __init__(self, v):
+        super().__init__(14)
+        self.value = v
+        self.prev_close = 100.0
+        self._fixed = v
+
+    def update(self, h, l, c):
+        self.bars += 1
+        self.prev_close = c
+        self.value = self._fixed
+        return self.value
 
 
 def freeze_atr(leg, v):
-    """Keep ATR fixed so expected ladder levels are exact."""
-    leg.atr.update = lambda h, l, c: v
-    leg.atr.value = v
+    leg.atr = FrozenATR(v)
 
 
 # ── 1. basic signal -> fill -> T1 -> T2 -> trail out ────────────────────────
@@ -165,14 +181,17 @@ check("stop at rung below highest", abs(pos.stop - 150.20) < 1e-6, pos.stop)
 
 
 # ── 6. VWAP is OHLC4 volume-weighted ───────────────────────────────────────
-print("\n[6] VWAP maths")
-v = SessionVWAP()
-v.update(10, 20, 10, 20, 100)      # ohlc4 = 15, vol 100
-v.update(20, 30, 20, 30, 300)      # ohlc4 = 25, vol 200
-check("ohlc4 weighted", abs(v.value - (15 * 100 + 25 * 200) / 300) < 1e-9, v.value)
-v.update(30, 30, 30, 30, 300)      # zero volume candle
-check("zero-volume candle carried forward",
-      abs(v.value - (15 * 100 + 25 * 200) / 300) < 1e-9, v.value)
+print("\n[6] VWAP wiring — per-bar volume reaches the study intact")
+e6, leg6 = new_engine()
+freeze_atr(leg6, 5.0)
+e6._process_candle(leg6, candle(0, 10, 20, 10, 20, 100))   # ohlc4=15, vol 100
+e6._process_candle(leg6, candle(1, 20, 30, 20, 30, 200))   # ohlc4=25, vol 200
+want6 = (15 * 100 + 25 * 200) / 300
+check("engine feeds per-bar volume", abs(leg6.vwap.value - want6) < 1e-9,
+      leg6.vwap.value)
+e6._process_candle(leg6, candle(2, 30, 30, 30, 30, 0))     # zero-volume bar
+check("zero-volume bar holds the line", abs(leg6.vwap.value - want6) < 1e-9,
+      leg6.vwap.value)
 
 
 # ── 7. Wilder ATR seeding ──────────────────────────────────────────────────
