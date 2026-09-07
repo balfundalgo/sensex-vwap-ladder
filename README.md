@@ -49,6 +49,33 @@ N=14 needs ~200 prior bars before the starting point stops mattering. We seed
 with 300 and log the residual at start-up; if it is above 1e-4 the ATR will not
 match the terminal and the log says so.
 
+## The 2-minute rollup — the thing that bites
+
+Kite has no native 2-minute feed. Zerodha serves **1-minute** bars and ChartIQ
+rolls them up in the browser. ChartIQ's own docs say how:
+
+> *"period describes the number of raw ticks from masterData to roll-up
+> together into one data point"* … *"the dataSet will be 1/3 the length of the
+> masterData"* … *"Aggregation is done by systematically picking the first
+> element in each periodicity range"* … *"Chart data can contain gaps… By
+> default, the charting library will collapse these gaps"*
+
+That is **bar-count** grouping, not wall-clock bucketing. Gaps are collapsed,
+surviving bars are grouped in twos, and the group takes the first bar's
+timestamp. On an option whose feed is missing even one minute, the two schemes
+desync permanently:
+
+```
+1-min bars present:  09:15 09:16 09:17 __:__ 09:19 09:20 09:21 09:22
+
+  bar-count (Kite):  09:15[15,16]  09:17[17,19]  09:20[20,21]  09:22[22]
+  wall-clock (naive):09:15[15,16]  09:17[17]     09:19[19,20]  09:21[21,22]
+                                        ^ diverges here and never re-syncs
+```
+
+Default is `agg_mode="count"`. `"clock"` is kept so calibration can prove which
+one the terminal is using.
+
 ## Reconciling against the terminal — in the app
 
 The **RECONCILE** panel at the bottom of the window shows every closed 2-minute
@@ -69,6 +96,41 @@ to re-run instantly — that is how you settle ohlc4-vs-hlc3 or wilder-vs-sma.
 
 Check in this order: timestamps line up, then per-bar volume, then VWAP, then
 ATR (09:15 value first — that is the one the overnight gap moves).
+
+### vwap_check.py — VWAP alone
+
+```bash
+python vwap_check.py --sec-id 860293 --head 30      # morning bars
+python vwap_check.py --sec-id 860293 --tail 10      # afternoon bars
+python vwap_check.py --sec-id 860293 --at 14:19     # full working for one bar
+python vwap_check.py --sec-id 860293 --at 14:19 --match 546.02
+python vwap_check.py --sec-id 860293 --basis both   # 2m vs 1m accumulation
+python vwap_check.py --sec-id 860293 --tail 10 --watch
+```
+
+All four price fields side by side. `--match` takes the value the chart shows
+and reports which field and accumulation basis reproduces it.
+
+**Compare the right row.** `--tail` puts the newest bar at the bottom, which is
+the natural one to look at and was for a while the one bar that could be wrong
+(a half-formed candle). That is fixed, but the habit is worth keeping: a
+confirmed bar never changes again, so if a row moves between two runs, it was
+not confirmed.
+
+### CALIBRATE — let the software find the settings
+
+Type into the calibrate row what Kite shows for **one bar** — the time, and any
+of close / VWAP / ATR — and press **FIND MATCH**. It brute-forces every
+combination of rollup mode x VWAP field x ATR method and ranks them by error.
+
+It reports in two steps, and step 1 is the one that matters:
+
+* **Step 1 — does our candle match the chart's candle at all?** If neither
+  rollup reproduces the close Kite shows, the *source bars* differ. Dhan and
+  Zerodha are different data vendors; no formula setting can reconcile a
+  different candle. Stop and decide on the data source.
+* **Step 2 — ranked settings.** If the candle does match, this tells you
+  exactly which three dropdown values to set.
 
 `reconcile.py` does the same thing headlessly for scripting; the GUI panel is
 the primary tool.
@@ -95,6 +157,53 @@ Kite chart exactly, which is the client's stated priority — but it means the
 09:15 candle's true range includes the overnight gap, so ATR is inflated for
 roughly 14 candles and early-morning rungs sit too wide. Measure the
 09:15–10:00 window separately in testing.
+
+## Where the data comes from
+
+Two sources, split by what each is good at:
+
+| | Source | Why |
+|---|---|---|
+| Candles, volume, VWAP, ATR, **signals** | **REST** | This is the path reconciled bar-by-bar against the broker's chart — and it matched under two different VWAP fields, which is why it is trusted |
+| LTP for the **trigger, stop and ladder rungs** | **WebSocket (ticker)** | REST cannot see inside a candle; spec §5 and §6 evaluate on traded price |
+
+Consequence worth stating: with REST owning candles, the websocket only needs
+Ticker mode, so `parse_quote()` — whose byte layout was never confirmed against
+a live BFO feed — is out of the critical path entirely. Volume now only ever
+comes from REST, where it was verified.
+
+`data_source="websocket"` restores the old tick-built candles if ever needed.
+
+### Dhan serves the candle that is still forming
+
+Measured: the bar labelled 15:05 was already in the API at **15:05:02**, and it
+keeps updating as the minute runs. Over a 10-minute probe, a still-forming bar
+was present on **every single poll**.
+
+That is fine for a chart and fatal here. A 2-minute bar is two 1-minute bars,
+so a pair can look complete while its second member is two seconds old — and a
+signal would be computed from a candle whose high, low, close and volume are
+all still moving. `RestCandleFeed.drop_forming()` removes every bar whose close
+is still in the future, once, before anything else sees the data. It is applied
+in the live feed, in `reconcile.py` and in the app's LOAD FROM HISTORY.
+
+### Measured latency
+
+```
+10 candles:  min 0.1s   avg 1.4s   max 3.0s
+```
+
+Comfortable. A 2-minute bar closing at 09:17 is in hand by 09:17:03, leaving
+almost the whole of the next candle for the order to fill.
+
+### The cost, and how it is watched
+
+A REST signal is only as timely as the API. Every bar records how long after
+its close it actually arrived. That is logged, shown in the app's status bar
+(`lag avg / max`), and warned about above 30s. The one-candle order window is
+what suffers if this degrades, so it is measured continuously rather than
+assumed. `python freshness.py --minutes 10` measures the same thing
+independently before you rely on it.
 
 ## Data feed
 
@@ -134,7 +243,83 @@ broker's chart before trusting anything downstream.
 ship disabled. Neither is the client's rule — turn them on only once he has
 given a number.
 
-## Setup
+## Setup — VS Code (recommended)
+
+```bash
+cd sensex-vwap-ladder
+./setup.sh
+```
+
+That creates `.venv`, installs dependencies, creates `.env` from the template
+and runs the offline tests. Then:
+
+1. `code .` (or File → Open Folder)
+2. Cmd+Shift+P → **Python: Select Interpreter** → `./.venv/bin/python`
+3. Fill your Dhan credentials into `.env`
+4. Press **F5** and pick a configuration
+
+| F5 configuration | What it does |
+|---|---|
+| 1 · Doctor (offline) | Python, deps, tkinter, `.env` — no network |
+| 2 · Doctor + API | Also logs in and probes the data feed |
+| 3 · App (GUI, paper) | The main window |
+| 4 · Reconcile | Today's strike, both legs, to the terminal |
+| 5 · Reconcile (prompted) | Asks for strike / leg / field / ATR method |
+| 6 · Engine only | Console, no GUI |
+| T1 / T2 / T3 | The three test suites |
+
+Breakpoints work everywhere. Good ones to start with: `_process_candle` in
+`engine.py` to watch a candle become a signal, and `SessionVWAP.update` in
+`indicators.py` to watch the line build bar by bar.
+
+Cmd+Shift+P → **Tasks: Run Task** gives the same things without the debugger,
+including **Run all tests**.
+
+### Start here every time
+
+```bash
+python doctor.py --api
+```
+
+It checks the login, the lot size, the expiry, the strike resolution, and then
+the historical feed — first bar of the day, how many gaps it has, whether the
+ATR warm-up is long enough, and whether the two rollup modes disagree. If
+something is wrong it usually says so before you open the GUI.
+
+### IPv6 is detected automatically
+
+`init_credentials()` probes IPv6 once with a 2-second budget and forces IPv4 if
+it does not answer. The client runs a packaged EXE and will never edit a `.env`,
+so this cannot depend on remembering a flag. Override with `DHAN_FORCE_IPV4=1`
+to always force, or `=0` to never.
+
+### If everything is slow
+
+A call that takes 80–160 seconds and *then succeeds* is almost never the API.
+It is usually a dead IPv6 route: macOS tries IPv6 first, stalls until the OS
+gives up, then falls back to IPv4. `doctor.py` times both paths and says so
+outright. The fix is one line in `.env`:
+
+```
+DHAN_FORCE_IPV4=1
+```
+
+All HTTP now goes through a pooled `requests.Session` with keep-alive, so the
+TCP and TLS handshake is paid once rather than on every poll — which matters a
+great deal for a strategy that polls every few seconds all session.
+
+### tkinter on macOS
+
+The GUI needs tkinter. Python from **python.org** bundles it; **Homebrew**
+python does not. If `doctor.py` reports it missing:
+
+```bash
+brew install python-tk
+```
+
+or install Python 3.11 from python.org, delete `.venv`, and re-run `./setup.sh`.
+
+## Setup — plain terminal
 
 ```bash
 pip install -r requirements.txt

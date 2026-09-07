@@ -127,5 +127,63 @@ check("VWAP begins at the anchor", rows[300]["vwap"] is not None, True)
 check("first session bar VWAP = its own ohlc4", rows[300]["vwap"], 100.0)
 check("ATR carries across the boundary", rows[300]["atr_bars"], 301)
 
+print("\n[11] Aggregation — bar-count (ChartIQ) vs wall-clock")
+from indicators import aggregate, calibrate
+anchor_of = lambda ts: 0
+full = [{"ts": m * 60, "open": 100.0 + m, "high": 101.0 + m, "low": 99.0 + m,
+         "close": 100.0 + m, "volume": 10} for m in range(8)]
+ac = aggregate(full, 2, "count", anchor_of)
+al = aggregate(full, 2, "clock", anchor_of)
+check("no gaps: same timestamps", [b["ts"] for b in ac], [b["ts"] for b in al])
+check("no gaps: same volumes", [b["volume"] for b in ac], [b["volume"] for b in al])
+
+gapped = [b for b in full if b["ts"] != 3 * 60]        # 09:18 never traded
+gc = aggregate(gapped, 2, "count", anchor_of)
+gl = aggregate(gapped, 2, "clock", anchor_of)
+check("count mode bar count", len(gc), 4)
+check("clock mode bar count", len(gl), 4)
+check("count mode conserves volume", sum(b["volume"] for b in gc), 70)
+check("clock mode conserves volume", sum(b["volume"] for b in gl), 70)
+check("count groups in pairs", [b["ts"] // 60 for b in gc], [0, 2, 5, 7])
+check("clock keeps wall-clock slots", [b["ts"] // 60 for b in gl], [0, 2, 4, 6])
+check("the two disagree after the gap",
+      [b["ts"] // 60 for b in gc] != [b["ts"] // 60 for b in gl], True)
+check("group takes first bar's timestamp", gc[1]["ts"], 120)
+check("group high is max of members", gc[1]["high"], 105.0)
+check("group close is last member's close", gc[1]["close"], 104.0)
+check("group volume is the sum", gc[1]["volume"], 20)
+
+print("\n[12] Calibration recovers the settings that generated a value")
+import random
+random.seed(3)
+day = 86400 * 20000
+src, px = [], 250.0
+for i in range(600):
+    hi = px + random.uniform(0.5, 4); lo = px - random.uniform(0.5, 4)
+    cl = random.uniform(lo, hi)
+    src.append({"ts": day + i * 60, "open": px, "high": hi, "low": lo,
+                "close": cl, "volume": random.randint(100, 900)})
+    px = cl
+anc = day + 300 * 60
+anch = lambda ts: anc if ts >= anc else day
+hhmm = lambda ts: f"{(ts % 86400) // 3600:02d}:{(ts % 3600) // 60:02d}"
+
+truth = compute_series(aggregate(src, 2, "count", anch), anc, "hlc3", 14, "wilder")
+tgt = [r for r in truth if r["ts"] >= anc and r["vwap"] is not None][10]
+ref = {"time": hhmm(tgt["ts"]), "close": round(tgt["close"], 2),
+       "vwap": round(tgt["vwap"], 2), "atr": round(tgt["atr"], 2)}
+ranked, checks = calibrate(src, anc, [ref], anch, to_hhmm=hhmm)
+best = ranked[0]
+check("recovers rollup mode", best["mode"], "count")
+check("recovers VWAP field", best["field"], "hlc3")
+check("recovers ATR method", best["method"], "wilder")
+check("best error is negligible", best["score"] < 0.02, True)
+check("candle check ran for both modes", len(checks), 2)
+check("the correct mode matches the close",
+      any(c["close_matches"] == 1 for c in checks if c["mode"] == "count"), True)
+print(f"        best={best['mode']}/{best['field']}/{best['method']}  "
+      f"vwap_err={best['vwap_err']:.4f}  atr_err={best['atr_err']:.4f}")
+check("wrong settings score worse", ranked[-1]["score"] > best["score"], True)
+
 print("\n" + ("ALL TESTS PASSED" if not FAILS else f"{len(FAILS)} FAILURES: {FAILS}"))
 sys.exit(1 if FAILS else 0)

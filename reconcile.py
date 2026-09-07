@@ -35,7 +35,100 @@ import sys
 from datetime import datetime
 
 import engine as E
-from indicators import compute_series, SessionVWAP, WilderATR
+from indicators import compute_series, calibrate, SessionVWAP, WilderATR
+from restfeed import RestCandleFeed
+
+
+def _compare_fields(c2, anchor, args, strike, side, sec, expiry):
+    """Every VWAP field side by side, so the chart can be matched by eye."""
+    fields = ("ohlc4", "hlc3", "hl2", "close")
+    cols = {f: compute_series(c2, anchor, f, args.atr_period, args.atr_method)
+            for f in fields}
+    sess = {f: [r for r in cols[f] if r["ts"] >= anchor] for f in fields}
+    n = len(sess["ohlc4"])
+
+    print(f"\n{'='*104}")
+    print(f"VWAP BY FIELD — SENSEX {strike} {side}   secId={sec}   expiry={expiry}")
+    print(f"rollup={args.agg}   ATR({args.atr_period},{args.atr_method})")
+    print("-" * 104)
+    print(f"{'time':>6} {'close':>9} {'volume':>10} " +
+          " ".join(f"{f:>10}" for f in fields) + f" {'ATR':>8}")
+    print("-" * 104)
+    show = range(n) if args.rows == 0 else range(min(args.rows, n))
+    for i in show:
+        r = sess["ohlc4"][i]
+        vals = " ".join(
+            f"{sess[f][i]['vwap']:>10.2f}" if sess[f][i]["vwap"] is not None
+            else f"{'-':>10}" for f in fields)
+        print(f"{E.epoch_to_ist(r['ts'], '%H:%M'):>6} {r['close']:>9.2f} "
+              f"{r.get('volume', 0):>10.0f} {vals} "
+              f"{r['atr']:>8.2f}" if r["atr"] is not None else "")
+    if args.rows and n > args.rows:
+        print(f"       ... {n - args.rows} more bars (use --rows 0 for all)")
+    last = {f: sess[f][-1]["vwap"] for f in fields if sess[f] and sess[f][-1]["vwap"]}
+    if last:
+        print("-" * 104)
+        print("last bar: " + "   ".join(f"{f}={v:.2f}" for f, v in last.items()))
+        spread = max(last.values()) - min(last.values())
+        print(f"spread between fields: {spread:.2f}  "
+              f"-> a field mix-up cannot explain an error much larger than this")
+    print("=" * 104)
+
+
+def _calibrate(raw, anchor, args, strike, side, sec, expiry):
+    """Brute-force the settings that reproduce one bar from the terminal."""
+    ref = {"time": args.time}
+    for k, v in (("close", args.close), ("vwap", args.vwap), ("atr", args.atr)):
+        if v is not None:
+            ref[k] = v
+    if len(ref) == 1:
+        sys.exit("Give at least one of --close / --vwap / --atr")
+
+    anchor_of = (lambda ts: E.session_anchor_epoch(
+        E.datetime.fromtimestamp(E._normalize_epoch(ts), tz=E.IST)))
+    ranked, checks = calibrate(raw, anchor, [ref], anchor_of,
+                               atr_period=args.atr_period,
+                               to_hhmm=lambda ts: E.epoch_to_ist(ts, "%H:%M"))
+
+    print(f"\n{'='*98}")
+    print(f"CALIBRATION — SENSEX {strike} {side}   secId={sec}   expiry={expiry}")
+    print("Kite shows at " + ref["time"] + ":  "
+          + "   ".join(f"{k}={v}" for k, v in ref.items() if k != "time"))
+    print("-" * 98)
+
+    if "close" in ref:
+        print("STEP 1 — is our candle the same candle the chart is drawing?")
+        for c in checks:
+            verdict = ("MATCH" if c["close_matches"]
+                       else f"NO   (off by {c['worst_close_err']:.2f})")
+            print(f"   rollup={c['mode']:<6} session bars={c['session_bars']:>4}"
+                  f"    close: {verdict}")
+        if not any(c["close_matches"] for c in checks):
+            print("""
+   >> Neither rollup reproduces the close Kite shows.
+   >> The SOURCE BARS differ, not the formulas. Dhan and Zerodha are separate
+      data vendors; no VWAP or ATR setting can reconcile a different candle.
+      Stop here and decide on the data source.""")
+        else:
+            print("   >> Our candle matches. Any remaining error is a settings"
+                  " question, below.")
+
+    print("\nSTEP 2 — settings ranked (lower error is better):")
+    print(f"   {'rollup':<8}{'field':<8}{'ATR':<9}{'VWAP err':>11}{'ATR err':>11}")
+    for r in ranked[:10]:
+        ve = f"{r['vwap_err']:.4f}" if r["vwap_err"] is not None else "-"
+        ae = f"{r['atr_err']:.4f}" if r["atr_err"] is not None else "-"
+        flag = "   <== BEST" if r is ranked[0] else ""
+        print(f"   {r['mode']:<8}{r['field']:<8}{r['method']:<9}"
+              f"{ve:>11}{ae:>11}{flag}")
+    b = ranked[0]
+    if b["matched"] == 0:
+        print(f"\n   No bar at {ref['time']} in our data. Check the time, or run"
+              f"\n   without --calibrate to list the bars we actually have.")
+    else:
+        print(f"\nUse:  --agg {b['mode']}  --field {b['field']}  "
+              f"--atr-method {b['method']}")
+    print("=" * 98)
 
 
 def main():
@@ -44,7 +137,8 @@ def main():
                     help="strike to check (default: today's opening strike)")
     ap.add_argument("--leg", choices=["CE", "PE", "BOTH"], default="BOTH")
     ap.add_argument("--field", default="ohlc4",
-                    help="VWAP price field: ohlc4 (default), hlc3, hl2, close")
+                    choices=["ohlc4", "hlc3", "hl2", "close", "all"],
+                    help="VWAP price field; 'all' prints every field side by side")
     ap.add_argument("--atr-period", type=int, default=14)
     ap.add_argument("--atr-method", choices=["wilder", "sma"], default="wilder")
     ap.add_argument("--seed-days", type=int, default=10,
@@ -52,7 +146,19 @@ def main():
     ap.add_argument("--rows", type=int, default=30,
                     help="session rows to print (0 = all)")
     ap.add_argument("--csv", default="", help="write to this file instead")
+    ap.add_argument("--agg", choices=["count", "clock"], default="count",
+                    help="2-minute rollup: count (ChartIQ/Kite) or clock")
+    ap.add_argument("--calibrate", action="store_true",
+                    help="search for the settings that reproduce the terminal")
+    ap.add_argument("--time", default="", help="bar time as Kite shows it, e.g. 10:31")
+    ap.add_argument("--close", type=float, default=None, help="close Kite shows")
+    ap.add_argument("--vwap", type=float, default=None, help="VWAP Kite shows")
+    ap.add_argument("--atr", type=float, default=None, help="ATR Kite shows")
     args = ap.parse_args()
+
+    if args.calibrate and not args.time:
+        sys.exit("--calibrate needs --time (and at least one of "
+                 "--close / --vwap / --atr)")
 
     if not E.DHAN_CLIENT_ID:
         sys.exit("Missing credentials — fill .env first")
@@ -97,7 +203,26 @@ def main():
 
         raw = E.fetch_intraday_1m(sec, E.SENSEX["segment"], "OPTIDX",
                                   days=args.seed_days)
-        c2 = E.aggregate_2m(raw)
+        # Dhan serves the minute that is still forming. Comparing that against
+        # a chart is comparing against a bar that has not finished happening.
+        import time as _t
+        _n0 = len(raw or [])
+        raw = RestCandleFeed.drop_forming(
+            [{**c, "ts": E._normalize_epoch(c["ts"])} for c in (raw or [])],
+            _t.time())
+        if _n0 - len(raw):
+            print(f"  ({_n0 - len(raw)} still-forming bar(s) excluded)")
+
+        if args.calibrate:
+            _calibrate(raw, anchor, args, strike, side, sec, expiry)
+            continue
+
+        c2 = E.aggregate_2m(raw, args.agg)
+
+        if args.field == "all":
+            _compare_fields(c2, anchor, args, strike, side, sec, expiry)
+            continue
+
         prior = [c for c in c2 if c["ts"] < anchor]
         today = [c for c in c2 if c["ts"] >= anchor]
 
@@ -111,7 +236,7 @@ def main():
         print(f"\n{'='*104}")
         print(f"SENSEX {strike} {side}   secId={sec}   expiry={expiry}")
         print(f"VWAP field={args.field}   ATR({args.atr_period},"
-              f"{args.atr_method}) continuous across sessions")
+              f"{args.atr_method}) continuous   rollup={args.agg}")
         print(f"Warm-up: {len(prior)} prior bars, seed influence {residual:.2e} "
               f"{'(converged)' if residual < 1e-4 else '(NOT CONVERGED — pull more history)'}")
         print(f"Session bars today: {len(today)}   "

@@ -22,14 +22,15 @@ print("\n[1] Window builds")
 win = A.SensexApp()
 win.update()
 check("app constructed", win is not None)
-check("reconcile panel exists", hasattr(win, "candle_box"))
-check("history button exists", hasattr(win, "btn_recon"))
+check("live candle panel exists", hasattr(win, "candle_box"))
+check("reconcile tooling removed", not hasattr(win, "btn_recon"), True)
+check("calibrate tooling removed", not hasattr(win, "cal_time"), True)
 check("study dropdowns exist", hasattr(win, "opt_field") and hasattr(win, "opt_atrm"))
 check("VWAP field defaults to ohlc4", win.opt_field.get() == "ohlc4", win.opt_field.get())
 check("ATR method defaults to wilder", win.opt_atrm.get() == "wilder", win.opt_atrm.get())
 check("ATR seed default is 300", win.ent_seed.get() == "300", win.ent_seed.get())
 
-print("\n[2] Live candles land in the reconcile table")
+print("\n[2] Live candles land in the table with VWAP and ATR")
 win._clear_candles()
 win._write_candles(f"{'leg':<4}{A.CANDLE_HEADER}\n")
 bars = [
@@ -49,8 +50,9 @@ check("times rendered", all(b["time"] in body for b in bars))
 check("vwap rendered", "252.50" in body and "255.80" in body)
 check("atr rendered", "13.20" in body)
 check("volume rendered", "9000" in body)
-check("above-VWAP flag correct", body.count("YES") == 2 and body.count("no") == 1,
-      f"YES={body.count('YES')} no={body.count('no')}")
+check("above/below VWAP flag correct",
+      body.count("ABOVE") == 2 and body.count("below") == 1,
+      f"ABOVE={body.count('ABOVE')} below={body.count('below')}")
 check("counter updated", "3 bars" in win.lbl_recon.cget("text"),
       win.lbl_recon.cget("text"))
 
@@ -70,11 +72,11 @@ check("null row rendered", "-" in win.candle_box.get("end-2l", "end"))
 check("4 rows now", len(win.candle_rows) == 4, len(win.candle_rows))
 
 print("\n[5] CSV export")
-for f in glob.glob(str(A.LOG_DIR / "reconcile_*.csv")):
+for f in glob.glob(str(A.LOG_DIR / "candles_*.csv")):
     os.remove(f)
 win._export_csv()
 win.update()
-files = glob.glob(str(A.LOG_DIR / "reconcile_*.csv"))
+files = glob.glob(str(A.LOG_DIR / "candles_*.csv"))
 check("file written", len(files) == 1, files)
 if files:
     with open(files[0]) as f:
@@ -82,8 +84,9 @@ if files:
     check("4 data rows", len(rows) == 4, len(rows))
     check("columns present",
           {"leg", "time", "open", "high", "low", "close", "volume", "vwap",
-           "atr", "source"} <= set(rows[0].keys()), list(rows[0].keys()))
-    check("source tagged live", rows[0]["source"] == "live", rows[0]["source"])
+           "atr"} <= set(rows[0].keys()), list(rows[0].keys()))
+    check("vwap in export", rows[0]["vwap"] not in ("", None), rows[0]["vwap"])
+    check("atr in export", rows[0]["atr"] not in ("", None), rows[0]["atr"])
 
 print("\n[6] Clear resets everything")
 win._clear_candles()
@@ -92,13 +95,20 @@ check("rows dropped", len(win.candle_rows) == 0)
 check("textbox emptied", win.candle_box.get("1.0", "end").strip() == "")
 check("counter cleared", win.lbl_recon.cget("text") == "")
 
-print("\n[7] Reconcile refuses to run without credentials")
-win.ent_cid.delete(0, "end"); win.ent_pin.delete(0, "end"); win.ent_totp.delete(0, "end")
-win._on_reconcile()
+print("\n[7] Studies are shown on the leg cards")
+win._handle("tick_update", {"total_pnl": 0, "packets": 1, "spot": 76400.0,
+    "legs": [{"leg": "PE", "state": "IDLE", "eligible": True, "ltp": 616.00,
+              "vwap": 549.55, "atr": 15.61, "pnl": 0, "trades": 0,
+              "attempts": 0, "trigger": 0, "stop": 0, "lots_open": 0,
+              "rung": 0, "E": 0}]})
 win.update()
-check("button stays enabled", win.btn_recon.cget("state") == "normal",
-      win.btn_recon.cget("state"))
-check("error logged", "Fill credentials" in win.trade_log.get("1.0", "end"))
+cells = win.leg_cards["PE"]["cells"]
+check("VWAP on the card", "549.55" in cells["vwap"].cget("text"),
+      cells["vwap"].cget("text"))
+check("ATR on the card", "15.61" in cells["atr"].cget("text"),
+      cells["atr"].cget("text"))
+check("LTP on the card", "616.00" in cells["ltp"].cget("text"),
+      cells["ltp"].cget("text"))
 
 print("\n[8] Config picks up the study settings")
 win.opt_field.set("hlc3"); win.opt_atrm.set("sma")

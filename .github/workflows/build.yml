@@ -18,6 +18,12 @@ jobs:
         shell: cmd
       - run: python test_logic.py
         shell: cmd
+      - run: python test_restfeed.py
+        shell: cmd
+      - run: python test_vwap_check.py
+        shell: cmd
+      - run: python test_vwap_check.py
+        shell: cmd
       # GUI test needs a desktop session. Windows runners have one, but this is
       # not allowed to block the EXE build if that ever changes.
       - run: python test_gui.py
@@ -28,6 +34,7 @@ jobs:
             --name "Balfund_SENSEX_VWAP_Ladder" ^
             --hidden-import customtkinter ^
             --hidden-import indicators ^
+            --hidden-import restfeed ^
             --hidden-import pyotp ^
             --hidden-import websocket ^
             --hidden-import certifi ^

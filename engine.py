@@ -26,6 +26,7 @@ from typing import Dict, Optional, List, Any
 from enum import Enum
 from pathlib import Path
 
+import socket
 import requests
 import pyotp
 import websocket
@@ -34,7 +35,9 @@ from dotenv import load_dotenv, set_key
 # Indicators live in their own module so that the live engine, the replay path
 # and reconcile.py are guaranteed to compute identically. See indicators.py for
 # the ChartIQ definitions these implement.
-from indicators import SessionVWAP, WilderATR, price_field, true_range
+from indicators import (SessionVWAP, WilderATR, price_field, true_range,
+                        aggregate, AGG_MODES)
+from restfeed import RestCandleFeed
 
 # ═══════════════════════════════════════════════════════════════════════════
 # PATHS
@@ -130,6 +133,103 @@ WS_URL: str = ""
 BASE_URL = "https://api.dhan.co/v2"
 IST = timezone(timedelta(hours=5, minutes=30))
 
+# requests accepts (connect, read). Bounding the CONNECT leg separately matters
+# because Python tries each resolved address in turn with the FULL timeout —
+# unlike curl, which races IPv4 and IPv6 in parallel. api.dhan.co advertises 8
+# IPv6 addresses, so with a dead IPv6 route and a 20s timeout, a single call
+# stalls 160s before it ever reaches IPv4. That is measured, not theoretical.
+CONNECT_TIMEOUT = 5.0
+
+# ═══════════════════════════════════════════════════════════════════════════
+# HTTP TRANSPORT
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Two things matter here and both were learned the hard way.
+#
+# 1. CONNECTION REUSE. A bare requests.post() opens a fresh TCP connection and
+#    a fresh TLS handshake for every call. The strategy polls every few seconds
+#    all session, so that cost is paid hundreds of times for no reason. A
+#    Session with keep-alive pays it once.
+#
+# 2. IPv6. If the host resolves to an IPv6 address whose route is broken, the
+#    OS sits in connect() until it times out before falling back to IPv4. The
+#    symptom is a call that takes 80-160 seconds and then succeeds, which looks
+#    like a slow API but is nothing of the sort. Setting DHAN_FORCE_IPV4=1 in
+#    .env makes urllib3 resolve A records only, skipping the dead path.
+
+def force_ipv4(enabled: bool = True):
+    """Make urllib3 resolve IPv4 only. See note above."""
+    try:
+        import urllib3.util.connection as u3c
+        u3c.allowed_gai_family = (lambda: socket.AF_INET) if enabled else \
+            (lambda: socket.AF_UNSPEC)
+        return True
+    except Exception as e:
+        log.warning(f"Could not set IPv4-only mode: {e}")
+        return False
+
+
+def auto_select_ip_family(host="api.dhan.co", port=443, budget=2.0) -> str:
+    """
+    Decide once, at start-up, whether IPv6 is usable.
+
+    Measured on a real machine: api.dhan.co advertises 8 IPv6 addresses, the
+    route to them was dead, and Python tries each in turn with the FULL socket
+    timeout — 8 x 20s = 160s per call, versus 0.03s over IPv4. curl hides this
+    because it races both families (Happy Eyeballs); Python does not.
+
+    The client runs a packaged EXE and will never edit a .env file, so this
+    cannot depend on someone remembering a flag. One probe, 2s budget, once.
+
+      DHAN_FORCE_IPV4=1  force IPv4, skip the probe
+      DHAN_FORCE_IPV4=0  never force, skip the probe
+      unset              probe and decide
+    """
+    v = os.getenv("DHAN_FORCE_IPV4", "").strip().lower()
+    if v in ("1", "true", "yes"):
+        force_ipv4(True)
+        log.info("DHAN_FORCE_IPV4=1 — resolving IPv4 only")
+        return "forced"
+    if v in ("0", "false", "no"):
+        log.info("DHAN_FORCE_IPV4=0 — auto-detection disabled")
+        return "disabled"
+
+    try:
+        infos = socket.getaddrinfo(host, port, socket.AF_INET6, socket.SOCK_STREAM)
+    except Exception:
+        return "no-ipv6"                      # nothing to stall on
+    if not infos:
+        return "no-ipv6"
+
+    af, st_, proto, _, sa = infos[0]
+    sock = None
+    t0 = time.time()
+    try:
+        sock = socket.socket(af, st_, proto)
+        sock.settimeout(budget)
+        sock.connect(sa)
+        log.info(f"IPv6 reachable in {time.time() - t0:.2f}s — leaving it enabled")
+        return "ipv6-ok"
+    except Exception:
+        force_ipv4(True)
+        log.warning(f"IPv6 to {host} did not answer within {budget:.0f}s "
+                    f"({len(infos)} address(es) advertised). Forcing IPv4 — "
+                    f"without this every call would stall behind each dead "
+                    f"address in turn.")
+        return "auto-ipv4"
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+SESSION = requests.Session()
+_adapter = requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=8,
+                                         max_retries=0)
+SESSION.mount("https://", _adapter)
+SESSION.mount("http://", _adapter)
+
 
 class RateGate:
     def __init__(self, max_per_sec: float):
@@ -155,7 +255,8 @@ class DhanTokenManager:
         if not token: return False
         try:
             h = {"access-token": token, "client-id": DHAN_CLIENT_ID}
-            return requests.get(f"{BASE_URL}/profile", headers=h, timeout=10).status_code == 200
+            return SESSION.get(f"{BASE_URL}/profile", headers=h,
+                               timeout=(CONNECT_TIMEOUT, 10)).status_code == 200
         except Exception:
             return False
 
@@ -163,7 +264,7 @@ class DhanTokenManager:
         try:
             h = {"access-token": token, "dhanClientId": DHAN_CLIENT_ID,
                  "Content-Type": "application/json"}
-            d = requests.get(f"{BASE_URL}/RenewToken", headers=h, timeout=15).json()
+            d = SESSION.get(f"{BASE_URL}/RenewToken", headers=h, timeout=15).json()
             if "accessToken" in d:
                 log.info("Token renewed")
                 return d["accessToken"]
@@ -183,7 +284,7 @@ class DhanTokenManager:
             log.info(f"Attempt {attempt+1}: TOTP={totp}")
             try:
                 params = {"dhanClientId": DHAN_CLIENT_ID, "pin": DHAN_PIN, "totp": totp}
-                d = requests.post(url, params=params, timeout=15).json()
+                d = SESSION.post(url, params=params, timeout=15).json()
                 if "accessToken" in d:
                     log.info("Token generated")
                     return d["accessToken"]
@@ -220,6 +321,7 @@ def set_credentials(cid, pin, totp, token=""):
 
 def init_credentials(status_cb=None):
     global HEADERS, WS_URL, DHAN_ACCESS_TOKEN
+    auto_select_ip_family()
     log.info("Authenticating with Dhan...")
     if status_cb: status_cb("Authenticating with Dhan...")
     token = DhanTokenManager().ensure_token()
@@ -246,7 +348,7 @@ def fetch_sensex_lot_size() -> Optional[int]:
     log.info("  Fetching SENSEX lot size from scrip master...")
     try:
         import io, csv as csvmod
-        r = requests.get(MASTER_URL, stream=True, timeout=120); r.raise_for_status()
+        r = SESSION.get(MASTER_URL, stream=True, timeout=120); r.raise_for_status()
         raw = r.content.decode("utf-8", errors="ignore")
         if raw.startswith("\ufeff"): raw = raw[1:]
         for row in csvmod.DictReader(io.StringIO(raw)):
@@ -271,8 +373,33 @@ def now_ist(): return datetime.now(IST)
 
 
 def _normalize_epoch(ts):
-    ts = int(ts); now_ts = int(time.time())
-    if int(4.5 * 3600) <= (ts - now_ts) <= int(6.5 * 3600): ts -= 19800
+    """
+    REST timestamps. Dhan v2 returns TRUE UNIX epoch — verified against the
+    sample values in their own historical-data docs, where a daily candle
+    lands exactly on 00:00 IST and consecutive candles show a three-day gap
+    across a weekend. So there is nothing to normalise: pass it through.
+
+    This used to carry a heuristic inherited from an earlier project:
+    "if the timestamp is 4.5-6.5 hours ahead of now, subtract 5:30". That
+    silently rewrote any bar falling in that window. A closed bar is never in
+    the future, so production was safe — but it made a 14:45 bar decode as
+    09:15 when the clock happened to read 09:50, which is how it was found.
+    Guessing at a convention we have since verified is not worth the risk.
+    """
+    return int(ts)
+
+
+def ws_epoch(ts):
+    """
+    WebSocket last-traded-time. This one genuinely may arrive shifted, and
+    unlike the REST feed it has not been verified, so the heuristic stays —
+    but scoped to the websocket path alone, where it cannot touch candle
+    construction in REST mode.
+    """
+    ts = int(ts)
+    now_ts = int(time.time())
+    if int(4.5 * 3600) <= (ts - now_ts) <= int(6.5 * 3600):
+        ts -= 19800
     return ts
 
 
@@ -321,20 +448,44 @@ def _hdrs():
             "client-id": HEADERS.get("client-id", "")}
 
 
-def api_post(endpoint, payload, retries=2):
+SLOW_CALL_SECONDS = 3.0     # anything above this is worth knowing about
+
+
+def api_post(endpoint, payload, retries=2, timeout=15):
+    """
+    POST with rate gating, retries, and timing.
+
+    Dhan allows 5 requests/second on Data APIs and 1 per 3 seconds on the
+    option chain; the gates above enforce that. What the gates cannot protect
+    against is the API simply being slow, which matters enormously here — the
+    strategy acts on a candle close and the order lives for one candle, so a
+    call that takes 30 seconds is not a slow call, it is a missed trade. Every
+    call is therefore timed and anything sluggish is logged.
+    """
     if "optionchain" in endpoint: OC_GATE.wait()
     else: DATA_GATE.wait()
     for att in range(retries + 1):
+        t0 = time.time()
         try:
-            r = requests.post(f"{BASE_URL}{endpoint}", headers=_hdrs(),
-                              json=payload, timeout=20)
+            r = SESSION.post(f"{BASE_URL}{endpoint}", headers=_hdrs(),
+                              json=payload,
+                              timeout=(CONNECT_TIMEOUT, timeout))
+            dt = time.time() - t0
+            if dt > SLOW_CALL_SECONDS:
+                log.warning(f"  SLOW API {endpoint} took {dt:.1f}s "
+                            f"(HTTP {r.status_code})")
             if r.status_code == 200: return r.json()
             if r.status_code == 429:
+                log.warning(f"  API {endpoint} rate limited, backing off")
                 time.sleep(2 ** (att + 1)); continue
             log.error(f"  API {endpoint} -> HTTP {r.status_code}: {r.text[:200]}")
             if att < retries: time.sleep(1.5)
+        except requests.exceptions.Timeout:
+            log.error(f"  API {endpoint} TIMED OUT after {timeout}s "
+                      f"(attempt {att + 1}/{retries + 1})")
+            if att < retries: time.sleep(1.5)
         except Exception as e:
-            log.error(f"  API {endpoint} error: {e}")
+            log.error(f"  API {endpoint} error after {time.time() - t0:.1f}s: {e}")
             if att < retries: time.sleep(1.5)
     return None
 
@@ -354,7 +505,7 @@ def place_order_limit_ioc(security_id, segment, side, qty, price,
         log.info(f"  [ORDER] {side} {segment}:{security_id} qty={qty} "
                  f"LIMIT@{adj} (att {att+1}/{max_retries})")
         try:
-            r = requests.post(f"{BASE_URL}/orders", headers=_hdrs(), json=pl, timeout=15)
+            r = SESSION.post(f"{BASE_URL}/orders", headers=_hdrs(), json=pl, timeout=15)
             if r.status_code == 200:
                 d = r.json()
                 oid = str(d.get("orderId", ""))
@@ -371,7 +522,7 @@ def place_order_limit_ioc(security_id, segment, side, qty, price,
                     for _ in range(6):
                         time.sleep(0.4); ORDER_GATE.wait()
                         try:
-                            pr = requests.get(f"{BASE_URL}/orders/{oid}",
+                            pr = SESSION.get(f"{BASE_URL}/orders/{oid}",
                                               headers=_hdrs(), timeout=10)
                             if pr.status_code == 200:
                                 pd = pr.json()
@@ -383,7 +534,7 @@ def place_order_limit_ioc(security_id, segment, side, qty, price,
                                 if ps in ("REJECTED", "CANCELLED"): break
                         except Exception: pass
                     try:
-                        requests.delete(f"{BASE_URL}/orders/{oid}", headers=_hdrs(), timeout=10)
+                        SESSION.delete(f"{BASE_URL}/orders/{oid}", headers=_hdrs(), timeout=10)
                     except Exception: pass
             else:
                 log.error(f"  [ORDER] HTTP {r.status_code}: {r.text[:200]}")
@@ -405,7 +556,7 @@ def place_order_market(security_id, segment, side, qty) -> dict:
           "disclosedQuantity": 0, "price": 0, "triggerPrice": 0,
           "afterMarketOrder": False}
     try:
-        r = requests.post(f"{BASE_URL}/orders", headers=_hdrs(), json=pl, timeout=15)
+        r = SESSION.post(f"{BASE_URL}/orders", headers=_hdrs(), json=pl, timeout=15)
         if r.status_code == 200:
             d = r.json()
             oid = str(d.get("orderId", ""))
@@ -416,7 +567,7 @@ def place_order_market(security_id, segment, side, qty) -> dict:
             for _ in range(8):
                 time.sleep(0.5); ORDER_GATE.wait()
                 try:
-                    pr = requests.get(f"{BASE_URL}/orders/{oid}", headers=_hdrs(), timeout=10)
+                    pr = SESSION.get(f"{BASE_URL}/orders/{oid}", headers=_hdrs(), timeout=10)
                     if pr.status_code == 200:
                         pp = float(pr.json().get("averageTradedPrice", 0) or 0)
                         if pp > 0:
@@ -475,7 +626,9 @@ def fetch_intraday_1m(security_id, segment, instrument, days=6) -> List[dict]:
     payload = {"securityId": str(security_id), "exchangeSegment": segment,
                "instrument": instrument, "interval": "1",
                "fromDate": fr_d, "toDate": to_d}
-    resp = api_post("/charts/intraday", payload)
+    # Short timeout on purpose: a candle that arrives very late is useless to
+    # the strategy, so failing fast and retrying next poll beats blocking.
+    resp = api_post("/charts/intraday", payload, retries=1, timeout=12)
     if not resp or "open" not in resp: return []
     n = len(resp["open"])
     tss = resp.get("timestamp", [0] * n)
@@ -489,24 +642,17 @@ def fetch_intraday_1m(security_id, segment, instrument, days=6) -> List[dict]:
     return out
 
 
-def aggregate_2m(candles_1m: List[dict]) -> List[dict]:
-    """Aggregate 1-minute candles into session-anchored 2-minute candles."""
-    buckets: Dict[int, dict] = {}
-    for c in candles_1m:
-        ts = _normalize_epoch(c["ts"])
-        if ts <= 0: continue
-        key = bucket_start_epoch(ts)
-        b = buckets.get(key)
-        if b is None:
-            buckets[key] = {"ts": key, "open": c["open"], "high": c["high"],
-                            "low": c["low"], "close": c["close"],
-                            "volume": c["volume"]}
-        else:
-            b["high"] = max(b["high"], c["high"])
-            b["low"] = min(b["low"], c["low"])
-            b["close"] = c["close"]
-            b["volume"] += c["volume"]
-    return [buckets[k] for k in sorted(buckets)]
+def aggregate_2m(candles_1m: List[dict], mode: str = "count") -> List[dict]:
+    """
+    Roll Dhan's 1-minute bars into the 2-minute bars the chart draws.
+
+    mode="count" groups every 2 SURVIVING bars, which is what ChartIQ (and so
+    Kite) does — gaps are collapsed, not preserved. mode="clock" buckets by
+    wall clock instead. They agree only when no minute is missing.
+    """
+    return aggregate(candles_1m, period=2, mode=mode,
+                     anchor_of=lambda ts: session_anchor_epoch(
+                         datetime.fromtimestamp(_normalize_epoch(ts), tz=IST)))
 
 
 def get_sensex_open_0915() -> Optional[float]:
@@ -605,7 +751,7 @@ class CandleEngine:
         self.ticks = 0
 
     def on_tick(self, ltp, ltt, cum_vol=None):
-        ltp = float(ltp); ltt = _normalize_epoch(int(ltt))
+        ltp = float(ltp); ltt = ws_epoch(int(ltt))
         b = bucket_start_epoch(ltt, self.interval)
         completed = None
         with self.lock:
@@ -656,6 +802,10 @@ class StrategyConfig:
     stop_buffer: float = 1.00         # below signal candle low
     atr_period: int = 14
     vwap_field: str = "ohlc4"         # must match the label on his chart
+    agg_mode: str = "count"           # "count" = ChartIQ/Kite | "clock"
+    data_source: str = "rest"         # "rest" (verified path) | "websocket"
+    rest_poll: float = 4.0            # seconds between REST polls
+    rest_grace: float = 6.0           # declare a bar closed this long after
     atr_method: str = "wilder"        # "wilder" (ChartIQ Math) | "sma"
     rung_atr_mult: float = 2.0        # Tn = E + 2*ATR*n
     cost_plus: float = 2.00           # stop after T1 = E + 2
@@ -716,6 +866,7 @@ class Leg:
     attempts: int = 0
     atr_ok: bool = False
     candles_seen: int = 0
+    seeded_upto: int = 0
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -740,6 +891,7 @@ class SensexVWAPLadderEngine:
         self.by_sec: Dict[str, Leg] = {}
 
         self.candle_engines: Dict[str, CandleEngine] = {}
+        self.rest_feed: Optional[RestCandleFeed] = None
         self.ws = None
         self.ws_connected = threading.Event()
 
@@ -829,7 +981,21 @@ class SensexVWAPLadderEngine:
         """Seed the continuous ATR from prior-session candles (spec 3.1)."""
         log.info(f"  Seeding indicators: {leg.label}...")
         raw = fetch_intraday_1m(leg.sec_id, SENSEX["segment"], "OPTIDX", days=10)
-        c2 = aggregate_2m(raw)
+
+        # Dhan serves the minute that is still building. If it survives into
+        # the seed, the last replayed 2-minute bar is built from a half-formed
+        # minute, that wrong value is baked permanently into VWAP and ATR, and
+        # seeded_upto primes the feed PAST it so the correct version never
+        # arrives. Drop it here, before anything is computed.
+        n_raw = len(raw or [])
+        raw = RestCandleFeed.drop_forming(
+            [{**c, "ts": _normalize_epoch(c["ts"])} for c in (raw or [])],
+            time.time())
+        if n_raw - len(raw):
+            log.info(f"  [{leg.label}] excluded {n_raw - len(raw)} still-forming "
+                     f"minute(s) from the seed")
+
+        c2 = aggregate_2m(raw, self.config.agg_mode)
 
         anchor = session_anchor_epoch()
         prior = [c for c in c2 if c["ts"] < anchor]
@@ -870,13 +1036,55 @@ class SensexVWAPLadderEngine:
             leg.atr_ok = True
             log.info(f"  [{leg.label}] Session-only ATR now valid: {leg.atr.value:.2f}")
 
-        ce = CandleEngine(leg.sec_id, leg.label, 120, on_close=self._on_candle_close)
-        self.candle_engines[leg.sec_id] = ce
+        if self.config.data_source == "websocket":
+            ce = CandleEngine(leg.sec_id, leg.label, 120,
+                              on_close=self._on_candle_close)
+            self.candle_engines[leg.sec_id] = ce
+        leg.seeded_upto = today[-1]["ts"] if today else 0
         log.info(f"  [{leg.label}] seeded: {len(prior)} prior + {len(today)} today, "
                  f"ATR={leg.atr.value if leg.atr.value else 0:.2f}, "
                  f"VWAP={leg.vwap.value if leg.vwap.value else 0:.2f}")
 
     # ─── candle handling ───
+
+    def _on_rest_bar(self, leg_name: str, bar: dict):
+        leg = self.legs.get(leg_name)
+        if not leg:
+            return
+        try:
+            self._process_candle(leg, bar, replay=False)
+            if leg.candles_seen <= 3 or leg.candles_seen % 30 == 0:
+                log.info(f"  [{leg.label}] live bar "
+                         f"{epoch_to_ist(bar['ts'], '%H:%M')} "
+                         f"O{bar['open']:.2f} H{bar['high']:.2f} "
+                         f"L{bar['low']:.2f} C{bar['close']:.2f} "
+                         f"V{bar.get('volume', 0):.0f} | "
+                         f"VWAP {leg.vwap.value:.2f} ATR {leg.atr.value:.2f}"
+                         if leg.vwap.value and leg.atr.value else "")
+        except Exception as e:
+            log.error(f"  [{leg.label}] REST bar error: {e}")
+
+    def _on_rest_latency(self, leg_name: str, ts: int, lag: float):
+        self._emit("bar_latency", {"leg": leg_name, "lag": lag,
+                                   "time": epoch_to_ist(ts, "%H:%M")})
+
+    def _start_rest_feed(self):
+        legs = {n: l.sec_id for n, l in self.legs.items() if l.sec_id}
+        self.rest_feed = RestCandleFeed(
+            legs=legs,
+            fetch_1m=lambda sec, days=1: fetch_intraday_1m(
+                sec, SENSEX["segment"], "OPTIDX", days=days),
+            aggregate_fn=aggregate,
+            anchor_of=lambda ts: session_anchor_epoch(
+                datetime.fromtimestamp(_normalize_epoch(ts), tz=IST)),
+            on_bar=self._on_rest_bar,
+            on_latency=self._on_rest_latency,
+            period=2, poll=self.config.rest_poll,
+            grace=self.config.rest_grace, agg_mode=self.config.agg_mode)
+        for name, leg in self.legs.items():
+            if leg.seeded_upto:
+                self.rest_feed.prime(name, leg.seeded_upto)
+        self.rest_feed.start()
 
     def _on_candle_close(self, sec_id, candle):
         leg = self.by_sec.get(sec_id)
@@ -1229,16 +1437,29 @@ class SensexVWAPLadderEngine:
 
     def _subscribe(self, ws):
         idx = [{"ExchangeSegment": "IDX_I", "SecurityId": SENSEX["security_id"]}]
-        ws.send(json.dumps({"RequestCode": 15, "InstrumentCount": len(idx),
-                            "InstrumentList": idx}))
         opts = [{"ExchangeSegment": SENSEX["segment"], "SecurityId": l.sec_id}
                 for l in self.legs.values() if l.sec_id]
-        # RequestCode 17 = Quote mode. Required because VWAP needs traded volume,
-        # which the ticker packet does not carry.
-        ws.send(json.dumps({"RequestCode": 17, "InstrumentCount": len(opts),
-                            "InstrumentList": opts}))
-        log.info(f"WebSocket subscribed — index (ticker) + {len(opts)} legs (quote)")
-        self._emit("ws_connected", {"instruments": len(idx) + len(opts)})
+
+        if self.config.data_source == "rest":
+            # Candles and volume come from REST, so the feed only has to carry
+            # LTP for the trigger, the stop and the ladder. Ticker mode (15) is
+            # enough, which keeps the unverified quote-packet layout out of the
+            # critical path entirely.
+            ws.send(json.dumps({"RequestCode": 15,
+                                "InstrumentCount": len(idx) + len(opts),
+                                "InstrumentList": idx + opts}))
+            log.info(f"WebSocket subscribed (ticker/LTP only) — "
+                     f"index + {len(opts)} legs. Candles come from REST.")
+        else:
+            ws.send(json.dumps({"RequestCode": 15, "InstrumentCount": len(idx),
+                                "InstrumentList": idx}))
+            # Quote mode (17) carries traded volume, which tick-built VWAP needs.
+            ws.send(json.dumps({"RequestCode": 17, "InstrumentCount": len(opts),
+                                "InstrumentList": opts}))
+            log.info(f"WebSocket subscribed — index (ticker) + "
+                     f"{len(opts)} legs (quote)")
+        self._emit("ws_connected", {"instruments": len(idx) + len(opts),
+                                    "mode": self.config.data_source})
 
     def _on_ws_open(self, ws):
         self.ws_connected.set()
@@ -1265,7 +1486,11 @@ class SensexVWAPLadderEngine:
             leg = self.by_sec.get(sec_id)
             if leg:
                 ce = self.candle_engines.get(sec_id)
-                if ce: ce.on_tick(t["ltp"], t["ltt"])
+                if ce:
+                    ce.on_tick(t["ltp"], t["ltt"])
+                # Always drive execution from the tick, whichever source owns
+                # the candles: the trigger, the stop and the rungs need price
+                # resolution finer than a bar.
                 self._on_tick(leg, t["ltp"])
             return
 
@@ -1325,7 +1550,9 @@ class SensexVWAPLadderEngine:
                 "E": pos.E if pos else 0,
             })
             total += leg.pnl
+        feed = self.rest_feed.health() if self.rest_feed else None
         return {"legs": legs, "total_pnl": total, "spot": self.spot,
+                "feed": feed, "data_source": self.config.data_source,
                 "strike": self.strike, "expiry": self.expiry,
                 "lot_size": self.lot_size, "packets": self.packet_count,
                 "halted": self._halted}
@@ -1336,6 +1563,9 @@ class SensexVWAPLadderEngine:
         if not self.initialize():
             self._emit("error", {"msg": "Initialization failed"})
             return
+
+        if self.config.data_source == "rest":
+            self._start_rest_feed()
 
         threading.Thread(target=self._run_ws, daemon=True).start()
         self._emit("status", {"msg": "Waiting for WebSocket..."})
@@ -1355,6 +1585,13 @@ class SensexVWAPLadderEngine:
 
     def stop(self):
         self.stop_event.set()
+        if self.rest_feed:
+            h = self.rest_feed.health()
+            if h["bars"]:
+                log.info(f"  REST feed: {h['bars']} bars, avg lag "
+                         f"{h['avg_lag']:.1f}s, max {h['max_lag']:.1f}s "
+                         f"({h['verdict']})")
+            self.rest_feed.stop()
         if self.ws:
             try: self.ws.close()
             except Exception: pass
@@ -1365,16 +1602,138 @@ class SensexVWAPLadderEngine:
 # STANDALONE
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _console_monitor():
+    """
+    Print the same things the GUI shows, to the terminal.
+
+    Every closed bar, every state change, and a status line each minute. This
+    is the observation surface for a paper session run from VS Code — the log
+    file records everything, but this is what you actually watch.
+    """
+    state = {"last_status": 0.0, "bars": 0}
+
+    def cb(event, d):
+        if event == "candle":
+            state["bars"] += 1
+            v, a = d.get("vwap"), d.get("atr")
+            print(f"  {d['leg']:<3} {d['time']}  "
+                  f"O{d['open']:>8.2f} H{d['high']:>8.2f} L{d['low']:>8.2f} "
+                  f"C{d['close']:>8.2f} V{d.get('volume', 0):>9.0f}  "
+                  f"vwap {v:>8.2f}  atr {a:>6.2f}  "
+                  f"{'ABOVE' if v and d['close'] > v else 'below':<5} "
+                  f"{d.get('state', ''):<10} "
+                  f"{'eligible' if d.get('eligible') else 'spent'}"
+                  if v and a else
+                  f"  {d['leg']:<3} {d['time']}  warming up")
+
+        elif event == "strike":
+            print(f"\n  09:15 open {d.get('open', 0):.2f} -> strike "
+                  f"{d.get('strike')}   expiry {d.get('expiry')}   "
+                  f"lot {d.get('lot_size')}\n")
+        elif event == "seeded":
+            note = "converged" if d.get("residual", 1) < 1e-4 else "NOT CONVERGED"
+            print(f"  [{d['leg']}] ATR seeded {d['bars']} bars -> "
+                  f"{d.get('atr', 0):.2f}  ({note})")
+        elif event == "ws_connected":
+            print(f"  websocket up — {d.get('instruments')} instruments, "
+                  f"candles from {d.get('mode')}\n")
+            print(f"  {'leg':<4}{'time':<7}{'open':>9}{'high':>9}{'low':>9}"
+                  f"{'close':>9}{'volume':>10}   {'vwap':>8}   {'atr':>6}")
+            print("  " + "-" * 96)
+        elif event == "armed":
+            print(f"\n  >> [{d['leg']}] ARMED  trigger {d['trigger']:.2f}  "
+                  f"stop {d['stop']:.2f}  atr {d['atr']:.2f}  "
+                  f"T1 {d['t1']:.2f}  T2 {d['t2']:.2f}\n")
+        elif event == "order_cancelled":
+            print(f"\n  >> [{d['leg']}] order {d['trigger']:.2f} NOT TAKEN — "
+                  f"leg stands down until a close below VWAP\n")
+        elif event == "entry":
+            print(f"\n  >> [{d['leg']}] ENTRY {'(paper)' if d.get('paper') else 'LIVE'}"
+                  f"  E {d['E']:.2f}  fill {d['fill']:.2f}  qty {d['qty']}  "
+                  f"stop {d['stop']:.2f}\n")
+        elif event == "rung":
+            print(f"     T{d['rung']} at {d['price']:.2f} -> stop {d['stop']:.2f}")
+        elif event == "scale_out":
+            print(f"     {d['tag']} sold 1 lot at {d['price']:.2f}  "
+                  f"pnl {d['pnl']:+,.0f}  ({d['lots_left']} left)")
+        elif event == "trade_closed":
+            print(f"\n  >> [{d['leg']}] CLOSED {d['reason']} at rung T{d['rung']}"
+                  f"  pnl {d['pnl']:+,.0f}\n")
+        elif event == "halted":
+            print(f"\n  >> HALTED — {d.get('reason')}\n")
+        elif event == "error":
+            print(f"  !! {d.get('msg')}")
+        elif event == "tick_update":
+            now = time.time()
+            if now - state["last_status"] < 60:
+                return
+            state["last_status"] = now
+            f = d.get("feed") or {}
+            lag = (f"lag avg {f['avg_lag']:.1f}s max {f['max_lag']:.1f}s"
+                   if f.get("bars") else "no bars yet")
+            parts = []
+            for lg in d.get("legs", []):
+                parts.append(f"{lg['leg']} {lg['state']:<10} "
+                             f"ltp {lg['ltp']:>8.2f} "
+                             f"vwap {(lg['vwap'] or 0):>8.2f} "
+                             f"{'elig' if lg['eligible'] else 'spent'}")
+            print(f"  [{now_ist():%H:%M:%S}] spot {d.get('spot', 0):>9.2f}  "
+                  f"pnl {d.get('total_pnl', 0):+,.0f}  {lag}")
+            for pt in parts:
+                print(f"             {pt}")
+    return cb
+
+
 def main():
+    import argparse
+    ap = argparse.ArgumentParser(
+        description="SENSEX VWAP Ladder — console runner (paper by default)")
+    ap.add_argument("--live", action="store_true",
+                    help="place REAL orders. Paper mode is the default.")
+    ap.add_argument("--source", choices=["rest", "websocket"], default="rest",
+                    help="where candles come from")
+    ap.add_argument("--field", default="ohlc4",
+                    choices=["ohlc4", "hlc3", "hl2", "close"])
+    ap.add_argument("--atr-method", choices=["wilder", "sma"], default="wilder")
+    ap.add_argument("--agg", choices=["count", "clock"], default="count")
+    ap.add_argument("--poll", type=float, default=4.0)
+    ap.add_argument("--lots", type=int, default=3)
+    args = ap.parse_args()
+
     if not DHAN_CLIENT_ID or not DHAN_PIN or not DHAN_TOTP_SECRET:
         raise SystemExit("Missing credentials in .env")
+
+    cfg = StrategyConfig(paper_mode=not args.live, data_source=args.source,
+                         vwap_field=args.field, atr_method=args.atr_method,
+                         agg_mode=args.agg, rest_poll=args.poll, lots=args.lots)
+
+    print("=" * 100)
+    print(f"  SENSEX VWAP Ladder — {'LIVE ORDERS' if args.live else 'PAPER'}"
+          f"   candles={cfg.data_source}  vwap={cfg.vwap_field}  "
+          f"atr={cfg.atr_method}  rollup={cfg.agg_mode}  lots={cfg.lots}")
+    print(f"  logs -> {LOG_DIR}")
+    print("=" * 100)
+    if args.live:
+        print("\n  LIVE MODE. Real orders will be placed. Ctrl+C within 5s to abort.")
+        time.sleep(5)
+
     init_credentials()
-    engine = SensexVWAPLadderEngine(StrategyConfig(paper_mode=True))
+    engine = SensexVWAPLadderEngine(cfg, gui_callback=_console_monitor())
     try:
         engine.run()
     except KeyboardInterrupt:
+        print("\n  stopping...")
         engine.stop()
-        log.info("Shutdown complete")
+        summary = engine.get_summary()
+        print(f"\n  Day P&L {summary['total_pnl']:+,.0f}")
+        for lg in summary["legs"]:
+            print(f"    {lg['leg']}  {lg['attempts']} attempt(s), "
+                  f"{lg['trades']} filled, pnl {lg['pnl']:+,.0f}")
+        f = summary.get("feed") or {}
+        if f.get("bars"):
+            print(f"    feed: {f['bars']} bars, lag avg {f['avg_lag']:.1f}s "
+                  f"max {f['max_lag']:.1f}s ({f['verdict']})")
+        print(f"\n  logs written to {LOG_DIR}\n")
 
 
 if __name__ == "__main__":

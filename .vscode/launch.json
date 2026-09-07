@@ -1,0 +1,284 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "1 \u00b7 Doctor (offline checks)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/doctor.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": false
+    },
+    {
+      "name": "2 \u00b7 Doctor + API (login & data feed)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/doctor.py",
+      "args": [
+        "--api"
+      ],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": false
+    },
+    {
+      "name": "3 \u00b7 App (GUI, paper mode)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/app.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": false
+    },
+    {
+      "name": "4 \u00b7 Reconcile (today, both legs)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/reconcile.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": false
+    },
+    {
+      "name": "5 \u00b7 Reconcile (ask me strike & leg)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/reconcile.py",
+      "args": [
+        "--strike",
+        "${input:strike}",
+        "--leg",
+        "${input:leg}",
+        "--field",
+        "${input:field}",
+        "--atr-method",
+        "${input:atrMethod}",
+        "--rows",
+        "0"
+      ],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": false
+    },
+    {
+      "name": "5b \u00b7 Calibrate (prompted)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/reconcile.py",
+      "args": [
+        "--calibrate",
+        "--strike",
+        "${input:strike}",
+        "--leg",
+        "${input:leg}",
+        "--time",
+        "${input:barTime}",
+        "--close",
+        "${input:kiteClose}",
+        "--vwap",
+        "${input:kiteVwap}",
+        "--atr",
+        "${input:kiteAtr}"
+      ],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": false
+    },
+    {
+      "name": "5a \u00b7 VWAP vs chart (one shot)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/vwap_check.py",
+      "args": [
+        "--strike",
+        "${input:strike}",
+        "--leg",
+        "${input:leg}",
+        "--head",
+        "30"
+      ],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": false
+    },
+    {
+      "name": "5a-live \u00b7 VWAP live watch",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/vwap_check.py",
+      "args": [
+        "--strike",
+        "${input:strike}",
+        "--leg",
+        "${input:leg}",
+        "--tail",
+        "10",
+        "--watch"
+      ],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": false
+    },
+    {
+      "name": "5c \u00b7 Compare VWAP fields side by side",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/reconcile.py",
+      "args": [
+        "--strike",
+        "${input:strike}",
+        "--leg",
+        "${input:leg}",
+        "--field",
+        "all",
+        "--rows",
+        "0"
+      ],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": false
+    },
+    {
+      "name": "5d \u00b7 REST freshness probe (market hours)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/freshness.py",
+      "args": [
+        "--minutes",
+        "10"
+      ],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": false
+    },
+    {
+      "name": "6 \u00b7 Run in console (paper, REST candles)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/engine.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": false
+    },
+    {
+      "name": "T1 \u00b7 Test indicators",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/test_indicators.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": false
+    },
+    {
+      "name": "T2 \u00b7 Test strategy logic",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/test_logic.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": false
+    },
+    {
+      "name": "T3 \u00b7 Test GUI",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/test_gui.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": false
+    },
+    {
+      "name": "T4 \u00b7 Test REST feed",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/test_restfeed.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": false
+    },
+    {
+      "name": "T5 \u00b7 Test vwap_check paths",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/test_vwap_check.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": false
+    },
+    {
+      "name": "T5 \u00b7 Test vwap_check paths",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/test_vwap_check.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": false
+    }
+  ],
+  "inputs": [
+    {
+      "id": "strike",
+      "type": "promptString",
+      "description": "Strike (e.g. 77400)",
+      "default": "77400"
+    },
+    {
+      "id": "leg",
+      "type": "pickString",
+      "description": "Which leg?",
+      "options": [
+        "BOTH",
+        "CE",
+        "PE"
+      ],
+      "default": "PE"
+    },
+    {
+      "id": "field",
+      "type": "pickString",
+      "description": "VWAP price field",
+      "options": [
+        "ohlc4",
+        "hlc3",
+        "hl2",
+        "close"
+      ],
+      "default": "ohlc4"
+    },
+    {
+      "id": "atrMethod",
+      "type": "pickString",
+      "description": "ATR method",
+      "options": [
+        "wilder",
+        "sma"
+      ],
+      "default": "wilder"
+    },
+    {
+      "id": "barTime",
+      "type": "promptString",
+      "description": "Bar time as Kite shows it",
+      "default": "10:31"
+    },
+    {
+      "id": "kiteClose",
+      "type": "promptString",
+      "description": "CLOSE that Kite shows for that bar",
+      "default": "0"
+    },
+    {
+      "id": "kiteVwap",
+      "type": "promptString",
+      "description": "VWAP that Kite shows for that bar",
+      "default": "0"
+    },
+    {
+      "id": "kiteAtr",
+      "type": "promptString",
+      "description": "ATR that Kite shows for that bar",
+      "default": "0"
+    }
+  ]
+}

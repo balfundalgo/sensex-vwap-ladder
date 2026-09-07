@@ -1,13 +1,26 @@
+# secrets — never commit
 .env
 *.env
+!.env.example
+
+# virtual environments
+.venv/
+venv/
+
+# python
 __pycache__/
 *.py[cod]
+
+# build artefacts
 dist/
 build/
 *.spec
+
+# runtime output
 logs/*.log
 logs/*.csv
-*.json
-.vscode/
+snx_daily_state.json
+
+# editors — .vscode IS committed on purpose, it is part of the dev setup
 .idea/
 .DS_Store
