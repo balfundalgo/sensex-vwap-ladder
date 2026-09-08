@@ -110,6 +110,13 @@ check("ATR on the card", "15.61" in cells["atr"].cget("text"),
 check("LTP on the card", "616.00" in cells["ltp"].cget("text"),
       cells["ltp"].cget("text"))
 
+print("\n[7b] Waiting-for-open countdown is shown")
+win._handle("waiting_for_open", {"seconds": 754, "text": "12m"})
+win.update()
+check("countdown on the status bar", "12m" in win.lbl_status.cget("text"),
+      win.lbl_status.cget("text"))
+check("says market opens", "OPENS" in win.lbl_status.cget("text"), True)
+
 print("\n[8] Config picks up the study settings")
 win.opt_field.set("hlc3"); win.opt_atrm.set("sma")
 cfg = win._build_config()

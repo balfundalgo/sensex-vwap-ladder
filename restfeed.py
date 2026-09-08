@@ -38,6 +38,7 @@ so rather than the trades quietly getting worse.
 import time
 import threading
 import logging
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from typing import Dict, Callable, Optional, List
 
 log = logging.getLogger("SNX")
@@ -61,7 +62,8 @@ class RestCandleFeed:
                  aggregate_fn: Callable, anchor_of: Callable,
                  on_bar: Callable, period: int = 2, poll: float = 4.0,
                  grace: float = 6.0, agg_mode: str = "count", days: int = 10,
-                 on_latency: Optional[Callable] = None):
+                 on_latency: Optional[Callable] = None,
+                 session_anchor: Optional[int] = None):
         self.legs = dict(legs)                  # {"CE": sec_id, "PE": sec_id}
         self.fetch_1m = fetch_1m
         self.aggregate = aggregate_fn
@@ -73,6 +75,15 @@ class RestCandleFeed:
         self.grace = grace
         self.agg_mode = agg_mode
         self.days = days
+        # Nothing before today's 09:15 may ever reach the strategy.
+        #
+        # Learned the hard way on 08-Sep: the app was started at 08:54, before
+        # the market opened. The first poll returned 244 bars from the PREVIOUS
+        # session, and every one was emitted as a live bar — 488 warnings, six
+        # phantom signals fired before the open, and VWAP/ATR permanently
+        # polluted with yesterday's data. The trade taken that morning used a
+        # VWAP of 277.34 where the correct value was 366.88.
+        self.session_anchor = int(session_anchor) if session_anchor else 0
 
         self._last_ts: Dict[str, int] = {}      # last bar emitted, per leg
         self._stop = threading.Event()
@@ -81,6 +92,21 @@ class RestCandleFeed:
         self.polls = 0
         self.errors = 0
         self.dropped_forming = 0
+        self.dropped_stale = 0
+        self._warned_at = 0.0
+        self._suppressed = 0
+        self.late_bars = 0
+        self.stalls = 0
+        self.last_stall = 0.0
+        self.stall_seconds = 60.0
+        # A socket-level timeout is not a guarantee: on 08-Sep a call sat for
+        # 1249 seconds on a dead keep-alive connection despite a 12s read
+        # timeout. The poll therefore runs in a worker with a hard deadline —
+        # if it overruns we abandon it and carry on rather than going blind.
+        self.hard_deadline = 25.0
+        self._pool = ThreadPoolExecutor(max_workers=4,
+                                        thread_name_prefix="restpoll")
+        self._abandoned = 0
 
     # ─── lifecycle ───
 
@@ -99,19 +125,49 @@ class RestCandleFeed:
 
     def stop(self):
         self._stop.set()
+        try:
+            self._pool.shutdown(wait=False)
+        except Exception:
+            pass
 
     # ─── internals ───
 
     def _loop(self):
+        """
+        Poll each leg in turn.
+
+        A single call that blocks takes the whole feed with it — on 08-Sep one
+        /charts/intraday call hung for 1249 seconds on a dropped connection and
+        the strategy went blind for 20 minutes with nothing in the log to say
+        so. The engine cannot force a socket to return, but it can notice and
+        say so loudly, and it can re-sync rather than silently replaying a
+        backlog as though it were live.
+        """
         while not self._stop.is_set():
             for leg, sec in self.legs.items():
                 if self._stop.is_set():
                     break
+                t0 = time.time()
                 try:
-                    self._poll_leg(leg, sec)
+                    fut = self._pool.submit(self._poll_leg, leg, sec)
+                    fut.result(timeout=self.hard_deadline)
+                except FutureTimeout:
+                    self._abandoned += 1
+                    self.errors += 1
+                    log.error(f"  [{leg}] poll exceeded {self.hard_deadline:.0f}s "
+                              f"and was abandoned — carrying on rather than "
+                              f"blocking the feed. The orphaned request will "
+                              f"expire on its own.")
                 except Exception as e:
                     self.errors += 1
                     log.error(f"  [{leg}] REST poll error: {e}")
+                took = time.time() - t0
+                if took > self.stall_seconds:
+                    self.stalls += 1
+                    self.last_stall = took
+                    log.error(f"  [{leg}] poll BLOCKED for {took:.0f}s — the "
+                              f"strategy was blind for that period. "
+                              f"({self.stalls} stall(s) today)")
             self._stop.wait(self.poll)
 
     @staticmethod
@@ -160,6 +216,9 @@ class RestCandleFeed:
         for i, b in enumerate(bars):
             if b["ts"] <= last:
                 continue
+            if self.session_anchor and b["ts"] < self.session_anchor:
+                self.dropped_stale += 1
+                continue
             closed_at = b["ts"] + span
             complete = members[i] >= self.period or now >= closed_at + self.grace
             if not complete:
@@ -173,8 +232,21 @@ class RestCandleFeed:
                 except Exception:
                     pass
             if lag > 45:
-                log.warning(f"  [{leg}] bar {b['ts']} arrived {lag:.0f}s after it "
-                            f"closed — the one-candle order window is compromised")
+                # Rate-limited: a stall produces one warning per backlogged bar,
+                # which buries everything else in the log.
+                if now - self._warned_at > 60:
+                    extra = (f" ({self._suppressed} similar suppressed)"
+                             if self._suppressed else "")
+                    log.warning(f"  [{leg}] bar "
+                                f"{time.strftime('%H:%M', time.localtime(b['ts']))} "
+                                f"arrived {lag:.0f}s late — the one-candle order "
+                                f"window is compromised{extra}")
+                    self._warned_at = now
+                    self._suppressed = 0
+                    self.late_bars += 1
+                else:
+                    self._suppressed += 1
+                    self.late_bars += 1
 
             self._last_ts[leg] = b["ts"]
             self.on_bar(leg, b)
@@ -213,6 +285,8 @@ class RestCandleFeed:
         if not self.latencies:
             return {"bars": 0, "polls": self.polls, "errors": self.errors,
                     "dropped_forming": self.dropped_forming,
+                    "dropped_stale": self.dropped_stale, "stalls": self.stalls,
+                    "late_bars": self.late_bars, "abandoned": self._abandoned,
                     "avg_lag": None, "max_lag": None, "verdict": "no bars yet"}
         avg = sum(self.latencies) / len(self.latencies)
         mx = max(self.latencies)
@@ -220,4 +294,6 @@ class RestCandleFeed:
                    "tight" if mx < 30 else "TOO SLOW — entries will be missed")
         return {"bars": len(self.latencies), "polls": self.polls,
                 "errors": self.errors, "dropped_forming": self.dropped_forming,
+                "dropped_stale": self.dropped_stale, "stalls": self.stalls,
+                "late_bars": self.late_bars, "abandoned": self._abandoned,
                 "avg_lag": avg, "max_lag": mx, "verdict": verdict}

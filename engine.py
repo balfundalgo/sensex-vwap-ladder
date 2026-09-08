@@ -224,11 +224,42 @@ def auto_select_ip_family(host="api.dhan.co", port=443, budget=2.0) -> str:
             except Exception:
                 pass
 
-SESSION = requests.Session()
-_adapter = requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=8,
-                                         max_retries=0)
-SESSION.mount("https://", _adapter)
-SESSION.mount("http://", _adapter)
+# Two sessions, deliberately.
+#
+# A pooled connection that the server has quietly closed produces
+# RemoteDisconnected('Remote end closed connection without response') on the
+# next request. Seen twice on 08-Sep, once blocking a poll for 1249 seconds.
+# The cure is to let urllib3 retry a request that died on a stale socket.
+#
+# But that must NEVER apply to order placement: a POST /orders that appears to
+# fail may in fact have reached the exchange, and retrying it could double the
+# position. So reads retry and writes do not, and they cannot be confused
+# because they are different objects.
+from urllib3.util.retry import Retry
+
+_read_retry = Retry(total=3, connect=3, read=2, status=0, backoff_factor=0.4,
+                    allowed_methods=frozenset(["GET", "POST"]),
+                    raise_on_status=False)
+
+# RA17 never hit this problem because it never pools — a bare requests.post()
+# opens a fresh socket every call, so no socket can go stale. That is not a fix
+# worth copying (it pays a TCP+TLS handshake on every poll), but it is a useful
+# fallback: DHAN_NO_POOL=1 turns pooling off entirely and reverts to that
+# behaviour if pooling ever misbehaves again.
+_NO_POOL = os.getenv("DHAN_NO_POOL", "").strip().lower() in ("1", "true", "yes")
+
+SESSION = requests.Session()          # read-only: quotes, charts, chains
+SESSION.mount("https://", requests.adapters.HTTPAdapter(
+    pool_connections=1 if _NO_POOL else 4,
+    pool_maxsize=1 if _NO_POOL else 8,
+    max_retries=_read_retry))
+if _NO_POOL:
+    SESSION.headers["Connection"] = "close"
+    log.info("DHAN_NO_POOL set — connection reuse disabled")
+
+ORDER_SESSION = requests.Session()    # orders: never retried automatically
+ORDER_SESSION.mount("https://", requests.adapters.HTTPAdapter(
+    pool_connections=2, pool_maxsize=4, max_retries=0))
 
 
 class RateGate:
@@ -505,7 +536,7 @@ def place_order_limit_ioc(security_id, segment, side, qty, price,
         log.info(f"  [ORDER] {side} {segment}:{security_id} qty={qty} "
                  f"LIMIT@{adj} (att {att+1}/{max_retries})")
         try:
-            r = SESSION.post(f"{BASE_URL}/orders", headers=_hdrs(), json=pl, timeout=15)
+            r = ORDER_SESSION.post(f"{BASE_URL}/orders", headers=_hdrs(), json=pl, timeout=15)
             if r.status_code == 200:
                 d = r.json()
                 oid = str(d.get("orderId", ""))
@@ -522,7 +553,7 @@ def place_order_limit_ioc(security_id, segment, side, qty, price,
                     for _ in range(6):
                         time.sleep(0.4); ORDER_GATE.wait()
                         try:
-                            pr = SESSION.get(f"{BASE_URL}/orders/{oid}",
+                            pr = ORDER_SESSION.get(f"{BASE_URL}/orders/{oid}",
                                               headers=_hdrs(), timeout=10)
                             if pr.status_code == 200:
                                 pd = pr.json()
@@ -534,7 +565,7 @@ def place_order_limit_ioc(security_id, segment, side, qty, price,
                                 if ps in ("REJECTED", "CANCELLED"): break
                         except Exception: pass
                     try:
-                        SESSION.delete(f"{BASE_URL}/orders/{oid}", headers=_hdrs(), timeout=10)
+                        ORDER_SESSION.delete(f"{BASE_URL}/orders/{oid}", headers=_hdrs(), timeout=10)
                     except Exception: pass
             else:
                 log.error(f"  [ORDER] HTTP {r.status_code}: {r.text[:200]}")
@@ -556,7 +587,7 @@ def place_order_market(security_id, segment, side, qty) -> dict:
           "disclosedQuantity": 0, "price": 0, "triggerPrice": 0,
           "afterMarketOrder": False}
     try:
-        r = SESSION.post(f"{BASE_URL}/orders", headers=_hdrs(), json=pl, timeout=15)
+        r = ORDER_SESSION.post(f"{BASE_URL}/orders", headers=_hdrs(), json=pl, timeout=15)
         if r.status_code == 200:
             d = r.json()
             oid = str(d.get("orderId", ""))
@@ -567,7 +598,7 @@ def place_order_market(security_id, segment, side, qty) -> dict:
             for _ in range(8):
                 time.sleep(0.5); ORDER_GATE.wait()
                 try:
-                    pr = SESSION.get(f"{BASE_URL}/orders/{oid}", headers=_hdrs(), timeout=10)
+                    pr = ORDER_SESSION.get(f"{BASE_URL}/orders/{oid}", headers=_hdrs(), timeout=10)
                     if pr.status_code == 200:
                         pp = float(pr.json().get("averageTradedPrice", 0) or 0)
                         if pp > 0:
@@ -806,6 +837,8 @@ class StrategyConfig:
     data_source: str = "rest"         # "rest" (verified path) | "websocket"
     rest_poll: float = 4.0            # seconds between REST polls
     rest_grace: float = 6.0           # declare a bar closed this long after
+    ws_silence_seconds: float = 90.0  # force a reconnect after this much quiet
+    open_countdown_seconds: float = 120.0   # how often to report the wait
     atr_method: str = "wilder"        # "wilder" (ChartIQ Math) | "sma"
     rung_atr_mult: float = 2.0        # Tn = E + 2*ATR*n
     cost_plus: float = 2.00           # stop after T1 = E + 2
@@ -898,6 +931,7 @@ class SensexVWAPLadderEngine:
         self.trade_lock = threading.Lock()
         self.closed: List[dict] = []
         self.packet_count = 0
+        self.last_tick_at = 0.0
         self._quote_debug = 0
         self._halted = False
         self._trade_seq = 0
@@ -926,15 +960,10 @@ class SensexVWAPLadderEngine:
             self._emit("error", {"msg": "No SENSEX expiry found"}); return False
         log.info(f"  Expiry: {self.expiry}")
 
-        self.sensex_open = get_sensex_open_0915() or 0.0
+        self.sensex_open = self._wait_for_session_open()
         if self.sensex_open <= 0:
-            oc = fetch_option_chain(self.expiry)
-            if oc:
-                self.sensex_open = oc["spot_price"]
-                log.warning("  09:15 open unavailable — falling back to current spot. "
-                            "The strike may differ from the intended one.")
-            else:
-                self._emit("error", {"msg": "Could not resolve SENSEX open"}); return False
+            self._emit("error", {"msg": "Could not resolve the 09:15 SENSEX open"})
+            return False
 
         self.strike = int(round(self.sensex_open / 100.0) * 100)
         log.info(f"  SENSEX 09:15 open = {self.sensex_open:.2f} -> strike {self.strike}")
@@ -953,6 +982,69 @@ class SensexVWAPLadderEngine:
             self._seed_leg(leg)
 
         return True
+
+    def _wait_for_session_open(self, timeout_s: float = 1800.0) -> float:
+        """
+        The strike comes from the 09:15 index open, so it cannot be decided
+        before 09:15. If the app is started early, wait — do not guess.
+
+        On 08-Sep the app was started at 08:54 and fell back to the pre-market
+        spot of 76132.81, choosing strike 76100. The real 09:15 open was
+        75970.28, which is strike 76000. The client traded the wrong pair of
+        options all morning and only discovered it on a restart at 11:38.
+        A wrong strike is not a degraded trade, it is a different instrument.
+        """
+        anchor = session_anchor_epoch()
+        first_close = anchor + 120          # the 09:15 bar closes at 09:17
+
+        val = get_sensex_open_0915()
+        if val and time.time() >= first_close:
+            log.info(f"  SENSEX 09:15 open = {val:.2f}")
+            return val
+
+        deadline = time.time() + timeout_s
+        announced = False
+        last_tick = 0.0
+        while time.time() < deadline and not self.stop_event.is_set():
+            now = time.time()
+            if now < first_close:
+                wait = int(first_close - now)
+                if not announced:
+                    log.info(f"  MARKET NOT OPEN YET. Waiting for the 09:15 "
+                             f"candle before choosing a strike "
+                             f"({wait // 60}m {wait % 60}s to go). Progress is "
+                             f"reported every "
+                             f"{int(self.config.open_countdown_seconds // 60)} min.")
+                    self._emit("waiting_for_open",
+                               {"seconds": wait, "text": f"{wait // 60}m"})
+                    self._emit("status",
+                               {"msg": f"Market opens in ~{wait // 60} min"})
+                    announced = True
+                    last_tick = now
+                # Updated every couple of minutes, not every second. A
+                # ticking clock adds nothing and buries the rest of the log.
+                if now - last_tick >= self.config.open_countdown_seconds:
+                    last_tick = now
+                    mm = wait // 60
+                    self._emit("waiting_for_open",
+                               {"seconds": wait,
+                                "text": f"{mm}m" if mm else f"{wait}s"})
+                    self._emit("status", {"msg": f"Market opens in ~{mm} min"})
+                    log.info(f"  waiting for the 09:15 candle — "
+                             f"about {mm} min to go")
+                self.stop_event.wait(min(5.0, max(0.05, first_close - now)))
+                continue
+
+            val = get_sensex_open_0915()
+            if val:
+                log.info(f"  SENSEX 09:15 open = {val:.2f}")
+                return val
+            log.info("  09:15 candle not published yet, retrying in 5s...")
+            self.stop_event.wait(5.0)
+
+        log.error("  Gave up waiting for the 09:15 open. Refusing to guess a "
+                  "strike from the pre-market spot.")
+        return 0.0
 
     def _resolve_legs(self, oc: dict) -> bool:
         found = 0
@@ -1080,7 +1172,8 @@ class SensexVWAPLadderEngine:
             on_bar=self._on_rest_bar,
             on_latency=self._on_rest_latency,
             period=2, poll=self.config.rest_poll,
-            grace=self.config.rest_grace, agg_mode=self.config.agg_mode)
+            grace=self.config.rest_grace, agg_mode=self.config.agg_mode,
+            session_anchor=session_anchor_epoch())
         for name, leg in self.legs.items():
             if leg.seeded_upto:
                 self.rest_feed.prime(name, leg.seeded_upto)
@@ -1102,6 +1195,18 @@ class SensexVWAPLadderEngine:
           3. expire an unfilled armed order
           4. eligibility reset / new signal
         """
+        anchor = session_anchor_epoch()
+        if int(c["ts"]) < anchor:
+            # Belt and braces. The feed already filters these, but a bar from a
+            # previous session must never reach VWAP, ATR or the state machine
+            # by any route — on 08-Sep 244 of them did, and every downstream
+            # number was wrong for the rest of the day.
+            if not replay:
+                log.warning(f"  [{leg.label}] ignored a bar from "
+                            f"{epoch_to_ist(c['ts'], '%d-%b %H:%M')} — before "
+                            f"today's session")
+            return
+
         o, h, l, cl = c["open"], c["high"], c["low"], c["close"]
         # "volume" is ALWAYS this bar's own traded volume — historical candles
         # arrive that way from the API, and CandleEngine converts the live
@@ -1124,7 +1229,7 @@ class SensexVWAPLadderEngine:
                               leg=leg.name, sec_id=leg.sec_id, open=f"{o:.2f}",
                               high=f"{h:.2f}", low=f"{l:.2f}", close=f"{cl:.2f}",
                               candle_vol=f"{bar_vol:.0f}",
-                              cum_vol=f"{c.get('cum_vol', 0):.0f}",
+                              cum_vol=f"{c.get('cum_vol', bar_vol):.0f}",
                               vwap=f"{vwap:.2f}" if vwap else "",
                               atr=f"{atr:.2f}" if atr else "",
                               state=leg.state.value, eligible=leg.eligible)
@@ -1414,6 +1519,9 @@ class SensexVWAPLadderEngine:
 
     def _halt(self, reason: str):
         self._halted = True
+        if self.rest_feed:
+            self.rest_feed.stop()
+            log.info(f"  REST feed stopped ({reason})")
         for leg in self.legs.values():
             if leg.position:
                 self._exit_all(leg, leg.ltp or leg.position.E, reason)
@@ -1431,6 +1539,11 @@ class SensexVWAPLadderEngine:
                     self._exit_all(leg, leg.ltp or leg.position.E, "SQUARE_OFF")
                 leg.state = LegState.HALTED
             self._halted = True
+            if self.rest_feed:
+                self.rest_feed.stop()
+            log.info(f"  {self.config.square_off} SQUARE-OFF — engine halted, "
+                     f"REST feed stopped. Nothing further will be polled or "
+                     f"traded today.")
             self._emit("halted", {"reason": "SQUARE_OFF"})
 
     # ─── websocket ───
@@ -1473,6 +1586,7 @@ class SensexVWAPLadderEngine:
         hdr = parse_header(bytes(msg))
         if not hdr: return
         self.packet_count += 1
+        self.last_tick_at = time.time()
         sec_id = hdr["security_id"]
         code = hdr["resp_code"]
 
@@ -1517,13 +1631,45 @@ class SensexVWAPLadderEngine:
         log.warning(f"WS closed: {code} {msg}")
         self._emit("ws_disconnected", {})
 
+    def _ws_watchdog(self):
+        """
+        A websocket can stay 'connected' and deliver nothing.
+
+        On 08-Sep the feed dropped four times with ping/pong timeouts and lost
+        connections. Reconnecting on a visible close is easy; the dangerous
+        case is a socket that is open but silent, because the stop and the
+        ladder run on LTP. If no tick arrives for a while during market hours,
+        force a reconnect rather than trusting the connection.
+        """
+        while not self.stop_event.is_set():
+            self.stop_event.wait(10.0)
+            if self.stop_event.is_set() or self._halted:
+                continue
+            t = now_ist().time()
+            if not (hhmm("09:15") <= t <= hhmm("15:30")):
+                continue
+            if not self.last_tick_at:
+                continue
+            quiet = time.time() - self.last_tick_at
+            if quiet > self.config.ws_silence_seconds:
+                log.warning(f"  No websocket tick for {quiet:.0f}s during market "
+                            f"hours — forcing a reconnect.")
+                self.last_tick_at = time.time()
+                try:
+                    if self.ws:
+                        self.ws.close()
+                except Exception:
+                    pass
+
     def _run_ws(self):
         while not self.stop_event.is_set():
             try:
                 self.ws = websocket.WebSocketApp(
                     WS_URL, on_open=self._on_ws_open, on_message=self._on_ws_message,
                     on_error=self._on_ws_error, on_close=self._on_ws_close)
-                self.ws.run_forever(ping_interval=20, ping_timeout=10)
+                # 20/10 proved too tight on a real connection: four drops in a
+                # session, all client-side ping timeouts. Give the server room.
+                self.ws.run_forever(ping_interval=30, ping_timeout=15)
             except Exception as e:
                 log.error(f"WS exception: {e}")
             if not self.stop_event.is_set():
@@ -1568,6 +1714,7 @@ class SensexVWAPLadderEngine:
             self._start_rest_feed()
 
         threading.Thread(target=self._run_ws, daemon=True).start()
+        threading.Thread(target=self._ws_watchdog, daemon=True).start()
         self._emit("status", {"msg": "Waiting for WebSocket..."})
         self.ws_connected.wait(timeout=20)
         if not self.ws_connected.is_set():
@@ -1591,6 +1738,16 @@ class SensexVWAPLadderEngine:
                 log.info(f"  REST feed: {h['bars']} bars, avg lag "
                          f"{h['avg_lag']:.1f}s, max {h['max_lag']:.1f}s "
                          f"({h['verdict']})")
+                if h.get("late_bars"):
+                    log.warning(f"  {h['late_bars']} bar(s) arrived too late to "
+                                f"be traded on.")
+                if h.get("stalls"):
+                    log.warning(f"  REST feed stalled {h['stalls']} time(s) — "
+                                f"longest {self.rest_feed.last_stall:.0f}s. The "
+                                f"strategy was blind for those periods.")
+                if h.get("dropped_stale"):
+                    log.info(f"  {h['dropped_stale']} bar(s) from a previous "
+                             f"session were correctly ignored.")
             self.rest_feed.stop()
         if self.ws:
             try: self.ws.close()
@@ -1626,6 +1783,9 @@ def _console_monitor():
                   if v and a else
                   f"  {d['leg']:<3} {d['time']}  warming up")
 
+        elif event == "waiting_for_open":
+            print(f"  market opens in ~{d.get('text','?')} "
+                  f"(the strike comes from the 09:15 candle)")
         elif event == "strike":
             print(f"\n  09:15 open {d.get('open', 0):.2f} -> strike "
                   f"{d.get('strike')}   expiry {d.get('expiry')}   "

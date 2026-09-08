@@ -410,6 +410,9 @@ class SensexApp(ctk.CTk):
             self.lbl_lot.configure(text=str(d.get("lot_size", "—")))
             self._log(f"09:15 open {d.get('open',0):.2f} → strike {d.get('strike')} "
                       f"| exp {d.get('expiry')} | lot {d.get('lot_size')}")
+        elif ev == "waiting_for_open":
+            self.lbl_status.configure(
+                text=f"● MARKET OPENS IN ~{d.get('text','?')}", text_color=YEL)
         elif ev == "seeded":
             note = "converged" if d.get("residual", 1) < 1e-4 else "NOT CONVERGED"
             self._log(f"[{d.get('leg')}] ATR seeded {d.get('bars')} bars → "

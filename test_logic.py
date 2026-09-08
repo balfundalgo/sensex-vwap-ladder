@@ -215,5 +215,26 @@ check("volumes summed", agg[0]["volume"] == 20, agg[0]["volume"])
 check("high is max of pair", agg[0]["high"] == 106, agg[0]["high"])
 
 
+print("\n[9] REGRESSION 08-Sep: a bar from a previous session is rejected")
+# 244 of them reached VWAP and ATR on 08-Sep, fired six phantom signals before
+# the market opened, and left the morning's real trade using VWAP 277.34 where
+# the correct value was 366.88.
+e9, leg9 = new_engine()
+freeze_atr(leg9, 10.0)
+stale = {"ts": ANCHOR - 86400 + 4 * 3600, "open": 100.0, "high": 200.0,
+         "low": 90.0, "close": 190.0, "volume": 500000}
+e9._process_candle(leg9, stale)
+check("stale bar did not reach VWAP", leg9.vwap.value is None, True)
+check("stale bar did not arm the leg", leg9.state == LegState.IDLE, leg9.state)
+check("stale bar not counted", leg9.candles_seen == 0, leg9.candles_seen)
+
+# and the first REAL bar must give VWAP == its own ohlc4
+o, h, l, c = 323.00, 414.85, 323.00, 406.65
+e9._process_candle(leg9, candle(0, o, h, l, c, 100000))
+want = (o + h + l + c) / 4
+check("first session bar: VWAP equals its own ohlc4",
+      abs(leg9.vwap.value - want) < 1e-9, True)
+print(f"        VWAP = {leg9.vwap.value:.2f} (08-Sep produced 277.34 here)")
+
 print("\n" + ("ALL TESTS PASSED" if not FAILS else f"{len(FAILS)} FAILURES: {FAILS}"))
 sys.exit(1 if FAILS else 0)

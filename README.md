@@ -49,6 +49,49 @@ N=14 needs ~200 prior bars before the starting point stops mattering. We seed
 with 300 and log the residual at start-up; if it is above 1e-4 the ATR will not
 match the terminal and the log says so.
 
+## Nothing from a previous session may reach the strategy
+
+Two independent guards, because on 08-Sep this went wrong and every downstream
+number was wrong with it.
+
+The app was started at 08:54, before the market opened. `days=1` returned 244
+bars from the previous session and the feed emitted every one as live: 488
+warnings, six phantom signals fired before the open, and VWAP and ATR polluted
+for the rest of the day. The morning's trade used a VWAP of 277.34 where the
+correct value — the first bar's own OHLC4 — was 366.88.
+
+* `RestCandleFeed` is given the session anchor and drops anything before it
+* `_process_candle` rejects them again, so no other route can let one in
+
+The first bar of any session must have `VWAP == its own OHLC4`. That is
+asserted in the test suite, with the 08-Sep numbers.
+
+## Started before the open? It waits, and shows a countdown
+
+The app can be launched at any time. If the market has not opened it does not
+guess and it does not sit silently — it reports the wait once at startup and
+then every two minutes (`open_countdown_seconds`), so the log stays readable.
+Only when the 09:15 candle exists does it resolve the strike and start work.
+
+```
+MARKET NOT OPEN YET. Waiting for the 09:15 candle before choosing a
+strike (16m 48s to go). Progress is reported every 2 min.
+  waiting for the 09:15 candle — about 14 min to go
+  ...
+  SENSEX 09:15 open = 75970.28 -> strike 76000
+```
+
+## The strike cannot be chosen before 09:15
+
+Also from 08-Sep: started early, the engine fell back to the pre-market spot
+of 76132.81 and chose strike **76100**. The real 09:15 open was 75970.28 —
+strike **76000**. The client traded the wrong pair of options all morning and
+only found out on a restart at 11:38.
+
+The engine now waits for the 09:15 candle, however long that takes, and says
+so. It will not guess a strike from a pre-market quote. A wrong strike is not
+a degraded trade, it is a different instrument.
+
 ## The 2-minute rollup — the thing that bites
 
 Kite has no native 2-minute feed. Zerodha serves **1-minute** bars and ChartIQ
@@ -186,6 +229,32 @@ signal would be computed from a candle whose high, low, close and volume are
 all still moving. `RestCandleFeed.drop_forming()` removes every bar whose close
 is still in the future, once, before anything else sees the data. It is applied
 in the live feed, in `reconcile.py` and in the app's LOAD FROM HISTORY.
+
+### Connection handling
+
+Learned from 08-Sep, where two `RemoteDisconnected` errors appeared and one
+poll blocked for 1249 seconds:
+
+RA17 never hit this because it never pools — a bare `requests.post()` opens a
+fresh socket every call, so no socket can go stale. That is not a fix worth
+copying, since it pays a TCP and TLS handshake on every poll, but it is a
+useful fallback: **`DHAN_NO_POOL=1`** disables reuse entirely and reverts to
+that behaviour. RA17's websocket handling is identical to ours line for line
+(20/10 pings, 2s reconnect, no watchdog), so it would drop the same way.
+
+* **Two HTTP sessions.** Reads (charts, chains, quotes) retry on a stale
+  pooled connection. Orders **never** retry automatically — a POST that looks
+  like it failed may have reached the exchange, and a blind retry could double
+  the position. They are separate objects so the two can never be confused.
+* **Hard deadline on every poll.** A socket timeout is not a guarantee; that
+  1249s call had a 12s read timeout. Each poll now runs in a worker with a 25s
+  deadline and is abandoned if it overruns, so one dead connection cannot
+  blind the strategy.
+* **WebSocket watchdog.** A socket can stay open and deliver nothing, which is
+  worse than a clean drop because the stop and the ladder run on LTP. No tick
+  for 90 seconds during market hours forces a reconnect. Ping timings were
+  loosened from 20/10 to 30/15, which caused four client-side drops in one
+  session.
 
 ### Measured latency
 

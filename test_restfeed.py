@@ -158,6 +158,87 @@ print("\n[12] Latency is now measured against real closes, never negative")
 feed, got = make(bars_1m(4), ANCHOR + 4 * 60 + 5)
 check("no negative latency", all(l >= 0 for l in feed.latencies), True)
 
+print("\n[13] REGRESSION 08-Sep: yesterday's bars must never be emitted")
+# The app was started at 08:54. days=1 returned 244 bars from the previous
+# session and every one was emitted as live: 488 warnings, six phantom
+# signals before the open, VWAP and ATR polluted for the whole day.
+YESTERDAY = ANCHOR - 86400
+stale = [{"ts": YESTERDAY + i * 60, "open": 100.0, "high": 101.0, "low": 99.0,
+          "close": 100.0, "volume": 5000} for i in range(30)]
+fresh = bars_1m(4)
+got = []
+feed = RestCandleFeed(legs={"PE": "999"},
+                      fetch_1m=lambda sec, days=1: stale + fresh,
+                      aggregate_fn=aggregate, anchor_of=anchor_of,
+                      on_bar=lambda leg, b: got.append(b["ts"]),
+                      period=2, poll=0.01, session_anchor=ANCHOR)
+real = time.time
+time.time = lambda: ANCHOR + 10 * 60
+try:
+    feed._poll_leg("PE", "999")
+finally:
+    time.time = real
+check("no pre-session bar emitted", all(t >= ANCHOR for t in got), True)
+check("today's bars still emitted", len(got), 2)
+check("stale bars counted", feed.dropped_stale > 0, True)
+
+print("\n[14] Started before the open: nothing is emitted at all")
+got = []
+feed = RestCandleFeed(legs={"PE": "999"},
+                      fetch_1m=lambda sec, days=1: stale,
+                      aggregate_fn=aggregate, anchor_of=anchor_of,
+                      on_bar=lambda leg, b: got.append(b["ts"]),
+                      period=2, poll=0.01, session_anchor=ANCHOR)
+real = time.time
+time.time = lambda: ANCHOR - 20 * 60          # 08:55, before the market opens
+try:
+    feed._poll_leg("PE", "999")
+finally:
+    time.time = real
+check("nothing emitted before the open", len(got), 0)
+
+print("\n[15] Without the anchor the old behaviour returns (guard is load-bearing)")
+got = []
+feed = RestCandleFeed(legs={"PE": "999"},
+                      fetch_1m=lambda sec, days=1: stale + fresh,
+                      aggregate_fn=aggregate, anchor_of=anchor_of,
+                      on_bar=lambda leg, b: got.append(b["ts"]),
+                      period=2, poll=0.01)          # no session_anchor
+real = time.time
+time.time = lambda: ANCHOR + 10 * 60
+try:
+    feed._poll_leg("PE", "999")
+finally:
+    time.time = real
+check("unguarded feed does emit stale bars", any(t < ANCHOR for t in got), True)
+
+print("\n[16] The lag warning is rate-limited")
+import logging as _lg
+recs = []
+class Cap(_lg.Handler):
+    def emit(self, r): recs.append(r.getMessage())
+_lg.disable(_lg.NOTSET)
+lg = _lg.getLogger("SNX"); lg.addHandler(Cap()); lg.setLevel(_lg.WARNING)
+late = [{"ts": ANCHOR + i * 60, "open": 100.0, "high": 101.0, "low": 99.0,
+         "close": 100.0, "volume": 500} for i in range(40)]
+got = []
+feed = RestCandleFeed(legs={"PE": "999"},
+                      fetch_1m=lambda sec, days=1: late,
+                      aggregate_fn=aggregate, anchor_of=anchor_of,
+                      on_bar=lambda leg, b: got.append(b["ts"]),
+                      period=2, poll=0.01, session_anchor=ANCHOR)
+real = time.time
+time.time = lambda: ANCHOR + 3 * 3600          # everything is hours late
+try:
+    feed._poll_leg("PE", "999")
+finally:
+    time.time = real
+warns = [m for m in recs if "late" in m]
+check("20 late bars emitted", len(got), 20)
+check("but only one warning logged", len(warns), 1)
+check("every late bar is still counted", feed.health()["late_bars"], 20)
+_lg.disable(_lg.WARNING)
+
 print("\n" + ("ALL RESTFEED TESTS PASSED" if not FAILS
               else f"{len(FAILS)} FAILURES: {FAILS}"))
 sys.exit(1 if FAILS else 0)
