@@ -219,9 +219,13 @@ class SensexApp(ctk.CTk):
         pnl_card = ctk.CTkFrame(c, fg_color=CARD, height=85, corner_radius=10,
                                 border_width=1, border_color=BD)
         pnl_card.pack(fill="x", pady=(0, 4)); pnl_card.pack_propagate(False)
-        ctk.CTkLabel(pnl_card, text="TOTAL DAY P&L", font=FL, text_color=DIM).pack(pady=(8, 0))
+        ctk.CTkLabel(pnl_card, text="TOTAL DAY P&L", font=FL,
+                     text_color=DIM).pack(pady=(6, 0))
         self.lbl_pnl = ctk.CTkLabel(pnl_card, text="₹ 0", font=FB, text_color=TXT)
         self.lbl_pnl.pack()
+        self.lbl_pnl_split = ctk.CTkLabel(pnl_card, text="", font=FT2,
+                                          text_color=DIM)
+        self.lbl_pnl_split.pack()
 
         info = ctk.CTkFrame(c, fg_color=CARD, corner_radius=8, border_width=1,
                             border_color=BD)
@@ -263,7 +267,8 @@ class SensexApp(ctk.CTk):
         cells = {}
         rows = [("LTP", "ltp"), ("VWAP", "vwap"), ("ATR", "atr"), ("Trigger", "trig"),
                 ("Entry E", "E"), ("Stop", "stop"), ("T1 / T2", "tt"),
-                ("Lots open", "lots"), ("Rung", "rung"), ("Attempts", "att")]
+                ("Lots open", "lots"), ("Open P&L", "upnl"), ("Rung", "rung"),
+                ("Attempts", "att")]
         for i, (lbl, key) in enumerate(rows):
             ctk.CTkLabel(grid, text=lbl, font=FL, text_color=DIM, width=80, anchor="w"
                          ).grid(row=i, column=0, sticky="w", pady=1)
@@ -455,7 +460,11 @@ class SensexApp(ctk.CTk):
 
     def _update_dash(self, d):
         total = d.get("total_pnl", 0)
-        self.lbl_pnl.configure(text=f"₹{total:+,.0f}", text_color=GRN if total >= 0 else RED)
+        self.lbl_pnl.configure(text=f"₹{total:+,.0f}",
+                               text_color=GRN if total >= 0 else RED)
+        r, u = d.get("realised_pnl", 0), d.get("unrealised_pnl", 0)
+        self.lbl_pnl_split.configure(
+            text=f"booked ₹{r:+,.0f}     open ₹{u:+,.0f}" if (r or u) else "")
         pk = f"Packets: {d.get('packets',0):,}"
         fh = d.get("feed")
         if fh and fh.get("bars"):
@@ -473,8 +482,9 @@ class SensexApp(ctk.CTk):
             card = self.leg_cards[name]; c = card["cells"]
             st = leg["state"]
             card["state"].configure(text=st, text_color=STATE_COLORS.get(st, DIM))
-            pnl = leg["pnl"]
-            card["pnl"].configure(text=f"₹{pnl:+,.0f}", text_color=GRN if pnl >= 0 else RED)
+            pnl = leg.get("open_pnl", leg["pnl"])
+            card["pnl"].configure(text=f"₹{pnl:+,.0f}",
+                                  text_color=GRN if pnl >= 0 else RED)
 
             c["ltp"].configure(text=f"₹{leg['ltp']:.2f}" if leg["ltp"] else "—")
             c["vwap"].configure(text=f"₹{leg['vwap']:.2f}" if leg["vwap"] else "…")
@@ -489,6 +499,10 @@ class SensexApp(ctk.CTk):
             else:
                 c["tt"].configure(text="—")
             c["lots"].configure(text=str(leg["lots_open"]) if leg["lots_open"] else "—")
+            u = leg.get("unrealised", 0)
+            c["upnl"].configure(text=f"₹{u:+,.0f}" if leg["lots_open"] else "—",
+                                text_color=(GRN if u >= 0 else RED)
+                                if leg["lots_open"] else TXT)
             c["rung"].configure(text=f"T{leg['rung']}" if leg["rung"] else "—")
             c["att"].configure(text=f"{leg['attempts']} ({leg['trades']} filled)")
 

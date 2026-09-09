@@ -1,5 +1,5 @@
 """Offline logic tests — drives the state machine with synthetic candles/ticks."""
-import sys, logging
+import sys, time, logging
 logging.disable(logging.INFO)
 
 from engine import (SensexVWAPLadderEngine, StrategyConfig, Leg, LegState,
@@ -235,6 +235,56 @@ want = (o + h + l + c) / 4
 check("first session bar: VWAP equals its own ohlc4",
       abs(leg9.vwap.value - want) < 1e-9, True)
 print(f"        VWAP = {leg9.vwap.value:.2f} (08-Sep produced 277.34 here)")
+
+print("\n[10] Pre-open wait: counts down to 09:15, resolves as soon as it can")
+import engine as _E
+ANCH = _E.session_anchor_epoch()
+_real_time, _real_open = time.time, _E.get_sensex_open_0915
+
+
+class _Clock:
+    """A clock that advances on its own so the loop can actually finish."""
+    def __init__(self, start, step=0.5):
+        self.t, self.step = start, step
+
+    def __call__(self):
+        self.t += self.step
+        return self.t
+
+
+class _NoWait:
+    """stop_event stand-in: never set, and wait() returns immediately."""
+    def is_set(self): return False
+    def set(self): pass
+    def wait(self, _t=None): return False
+
+
+def drive(offset, candle_available, timeout_s=3.0):
+    seen = []
+    e = SensexVWAPLadderEngine(StrategyConfig())
+    e.stop_event = _NoWait()
+    e.gui_cb = lambda ev, d: seen.append((ev, d.get("msg") or d.get("text")))
+    time.time = _Clock(ANCH + offset)
+    _E.get_sensex_open_0915 = lambda: (75970.28 if candle_available else None)
+    try:
+        return e._wait_for_session_open(timeout_s=timeout_s), seen
+    finally:
+        time.time, _E.get_sensex_open_0915 = _real_time, _real_open
+
+
+val, seen = drive(-13 * 60 - 5, False)
+msgs = [str(m) for _, m in seen if m]
+check("counts down to 09:15 (~13m), not to 09:17 (~15m)",
+      any("13m" in m for m in msgs), msgs[:2])
+check("refuses to guess a strike", val == 0.0, val)
+
+val, seen = drive(5, True)
+check("resolves at 09:15:05 rather than waiting for 09:17", val == 75970.28, val)
+
+val, seen = drive(3, False)
+msgs = [str(m) for _, m in seen if m]
+check("once open, says it is reading the candle",
+      any("reading" in m for m in msgs), msgs[:2])
 
 print("\n" + ("ALL TESTS PASSED" if not FAILS else f"{len(FAILS)} FAILURES: {FAILS}"))
 sys.exit(1 if FAILS else 0)

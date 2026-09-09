@@ -993,12 +993,22 @@ class SensexVWAPLadderEngine:
         75970.28, which is strike 76000. The client traded the wrong pair of
         options all morning and only discovered it on a restart at 11:38.
         A wrong strike is not a degraded trade, it is a different instrument.
+
+        Two phases, reported differently because they are different things:
+
+          before 09:15   the market is shut. Count down to the OPEN, not to
+                         the first candle's close — an earlier build counted
+                         to 09:17 while saying "market opens in", which was
+                         wrong by two minutes.
+          from 09:15     the market is open. Dhan publishes the 09:15 candle
+                         while it is still forming, and a candle's OPEN is
+                         fixed the instant it opens, so the strike resolves at
+                         about 09:15:05 rather than waiting until 09:17.
         """
-        anchor = session_anchor_epoch()
-        first_close = anchor + 120          # the 09:15 bar closes at 09:17
+        anchor = session_anchor_epoch()          # 09:15:00 today
 
         val = get_sensex_open_0915()
-        if val and time.time() >= first_close:
+        if val and time.time() >= anchor:
             log.info(f"  SENSEX 09:15 open = {val:.2f}")
             return val
 
@@ -1007,40 +1017,41 @@ class SensexVWAPLadderEngine:
         last_tick = 0.0
         while time.time() < deadline and not self.stop_event.is_set():
             now = time.time()
-            if now < first_close:
-                wait = int(first_close - now)
+
+            # ── phase 1: the market has not opened ──
+            if now < anchor:
+                wait = int(anchor - now)
                 if not announced:
-                    log.info(f"  MARKET NOT OPEN YET. Waiting for the 09:15 "
-                             f"candle before choosing a strike "
-                             f"({wait // 60}m {wait % 60}s to go). Progress is "
-                             f"reported every "
+                    log.info(f"  MARKET NOT OPEN YET. It opens at 09:15 "
+                             f"({wait // 60}m {wait % 60}s away); the strike is "
+                             f"read from that candle. Progress every "
                              f"{int(self.config.open_countdown_seconds // 60)} min.")
-                    self._emit("waiting_for_open",
-                               {"seconds": wait, "text": f"{wait // 60}m"})
-                    self._emit("status",
-                               {"msg": f"Market opens in ~{wait // 60} min"})
                     announced = True
-                    last_tick = now
-                # Updated every couple of minutes, not every second. A
-                # ticking clock adds nothing and buries the rest of the log.
+                    last_tick = 0.0
                 if now - last_tick >= self.config.open_countdown_seconds:
                     last_tick = now
                     mm = wait // 60
-                    self._emit("waiting_for_open",
-                               {"seconds": wait,
-                                "text": f"{mm}m" if mm else f"{wait}s"})
-                    self._emit("status", {"msg": f"Market opens in ~{mm} min"})
-                    log.info(f"  waiting for the 09:15 candle — "
-                             f"about {mm} min to go")
-                self.stop_event.wait(min(5.0, max(0.05, first_close - now)))
+                    txt = f"{mm}m" if mm else f"{wait}s"
+                    self._emit("waiting_for_open", {"seconds": wait, "text": txt})
+                    self._emit("status", {"msg": f"Market opens in ~{txt}"})
+                    if mm:
+                        log.info(f"  market opens in about {mm} min")
+                self.stop_event.wait(min(5.0, max(0.05, anchor - now)))
                 continue
 
+            # ── phase 2: open, waiting for the candle to appear ──
             val = get_sensex_open_0915()
             if val:
-                log.info(f"  SENSEX 09:15 open = {val:.2f}")
+                log.info(f"  SENSEX 09:15 open = {val:.2f}  "
+                         f"(resolved {int(now - anchor)}s after the open)")
                 return val
-            log.info("  09:15 candle not published yet, retrying in 5s...")
-            self.stop_event.wait(5.0)
+            if now - last_tick >= 5.0:
+                last_tick = now
+                self._emit("waiting_for_open",
+                           {"seconds": 0, "text": "reading 09:15 candle"})
+                self._emit("status", {"msg": "Market open — reading the 09:15 candle"})
+            log.info("  09:15 candle not published yet, retrying in 2s...")
+            self.stop_event.wait(2.0)
 
         log.error("  Gave up waiting for the 09:15 open. Refusing to guess a "
                   "strike from the pre-market spot.")
@@ -1679,25 +1690,45 @@ class SensexVWAPLadderEngine:
     # ─── summary ───
 
     def get_summary(self):
+        """
+        P&L is reported in three parts.
+
+        `leg.pnl` only ever accumulates on a scale-out or an exit, so while a
+        position is open it contributes nothing — the counter sat at zero with
+        a live trade on screen. Unrealised mark-to-market is computed here from
+        the last traded price against the ladder reference E, the same basis
+        the exits use, so realised and unrealised are directly comparable.
+        """
         legs = []
         total = 0.0
+        realised_total = 0.0
+        unreal_total = 0.0
         for name, leg in self.legs.items():
             pos = leg.position
+            unreal = 0.0
+            if pos and leg.ltp and pos.lots_open:
+                unreal = (leg.ltp - pos.E) * pos.lots_open * pos.lot_size
             legs.append({
                 "leg": name, "label": leg.label, "strike": leg.strike,
                 "state": leg.state.value, "eligible": leg.eligible,
                 "ltp": leg.ltp, "vwap": leg.vwap.value, "atr": leg.atr.value,
                 "pnl": leg.pnl, "trades": leg.trades, "attempts": leg.attempts,
                 "candles": leg.candles_seen,
+                "realised": leg.pnl, "unrealised": unreal,
+                "open_pnl": leg.pnl + unreal,
                 "trigger": leg.trigger if leg.state == LegState.ARMED else 0,
                 "stop": pos.stop if pos else 0,
                 "lots_open": pos.lots_open if pos else 0,
                 "rung": pos.highest_rung if pos else 0,
                 "E": pos.E if pos else 0,
             })
-            total += leg.pnl
+            realised_total += leg.pnl
+            unreal_total += unreal
+            total += leg.pnl + unreal
         feed = self.rest_feed.health() if self.rest_feed else None
-        return {"legs": legs, "total_pnl": total, "spot": self.spot,
+        return {"legs": legs, "total_pnl": total,
+                "realised_pnl": realised_total, "unrealised_pnl": unreal_total,
+                "spot": self.spot,
                 "feed": feed, "data_source": self.config.data_source,
                 "strike": self.strike, "expiry": self.expiry,
                 "lot_size": self.lot_size, "packets": self.packet_count,
@@ -1837,8 +1868,10 @@ def _console_monitor():
                              f"ltp {lg['ltp']:>8.2f} "
                              f"vwap {(lg['vwap'] or 0):>8.2f} "
                              f"{'elig' if lg['eligible'] else 'spent'}")
+            r, u = d.get("realised_pnl", 0), d.get("unrealised_pnl", 0)
             print(f"  [{now_ist():%H:%M:%S}] spot {d.get('spot', 0):>9.2f}  "
-                  f"pnl {d.get('total_pnl', 0):+,.0f}  {lag}")
+                  f"pnl {d.get('total_pnl', 0):+,.0f} "
+                  f"(booked {r:+,.0f} / open {u:+,.0f})  {lag}")
             for pt in parts:
                 print(f"             {pt}")
     return cb

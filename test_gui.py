@@ -117,6 +117,23 @@ check("countdown on the status bar", "12m" in win.lbl_status.cget("text"),
       win.lbl_status.cget("text"))
 check("says market opens", "OPENS" in win.lbl_status.cget("text"), True)
 
+print("\n[7c] Open position P&L is shown, not just realised")
+win._handle("tick_update", {"total_pnl": 762.0, "realised_pnl": 0.0,
+    "unrealised_pnl": 762.0, "packets": 9, "spot": 75216.0,
+    "legs": [{"leg": "PE", "state": "IN_TRADE", "eligible": False,
+              "ltp": 318.50, "vwap": 300.0, "atr": 15.4, "pnl": 0.0,
+              "realised": 0.0, "unrealised": 762.0, "open_pnl": 762.0,
+              "trades": 1, "attempts": 1, "trigger": 0, "stop": 150.0,
+              "lots_open": 3, "rung": 0, "E": 305.80}]})
+win.update()
+check("header shows the open trade", "762" in win.lbl_pnl.cget("text"),
+      win.lbl_pnl.cget("text"))
+check("header splits booked vs open",
+      "booked" in win.lbl_pnl_split.cget("text"), win.lbl_pnl_split.cget("text"))
+check("leg card shows open P&L",
+      "762" in win.leg_cards["PE"]["cells"]["upnl"].cget("text"),
+      win.leg_cards["PE"]["cells"]["upnl"].cget("text"))
+
 print("\n[8] Config picks up the study settings")
 win.opt_field.set("hlc3"); win.opt_atrm.set("sma")
 cfg = win._build_config()

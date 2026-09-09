@@ -74,12 +74,20 @@ then every two minutes (`open_countdown_seconds`), so the log stays readable.
 Only when the 09:15 candle exists does it resolve the strike and start work.
 
 ```
-MARKET NOT OPEN YET. Waiting for the 09:15 candle before choosing a
-strike (16m 48s to go). Progress is reported every 2 min.
-  waiting for the 09:15 candle — about 14 min to go
+MARKET NOT OPEN YET. It opens at 09:15 (13m 05s away); the strike is
+read from that candle. Progress every 2 min.
+  market opens in about 11 min
+  market opens in about 9 min
   ...
-  SENSEX 09:15 open = 75970.28 -> strike 76000
+  SENSEX 09:15 open = 75970.28  (resolved 4s after the open) -> strike 76000
 ```
+
+Two phases, because they are different things. **Before 09:15** it counts down
+to the *open*. An earlier build counted to 09:17 — when the first candle
+closes — while saying "market opens in", so it was wrong by two minutes.
+**From 09:15** it polls for the candle: Dhan publishes it while it is still
+forming and a candle's open is fixed the instant it opens, so the strike
+resolves around 09:15:05 rather than 09:17.
 
 ## The strike cannot be chosen before 09:15
 
