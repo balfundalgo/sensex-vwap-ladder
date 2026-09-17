@@ -447,11 +447,29 @@ class SensexApp(ctk.CTk):
                       f"→ stop ₹{d.get('stop',0):.2f}")
         elif ev == "scale_out":
             self._log(f"   {d.get('tag')} sold 1 lot @ ₹{d.get('price',0):.2f} "
-                      f"PnL=₹{d.get('pnl',0):+,.0f} ({d.get('lots_left')} left)")
+                      f"this lot ₹{d.get('pnl',0):+,.0f} "
+                      f"({d.get('lots_left')} left)")
         elif ev == "trade_closed":
             pnl = d.get("pnl", 0); icon = "✅" if pnl >= 0 else "❌"
+            scaled = d.get("scaled", 0)
+            # The per-lot lines above and this one are different units. Left
+            # unlabelled, adding the whole column double-counts the scale-outs
+            # and inflates the day badly.
+            detail = (f"  = {scaled:+,.0f} scaled + {d.get('last_leg_pnl', 0):+,.0f} final"
+                      if abs(scaled) > 0.005 else "")
             self._log(f"{icon} [{d.get('leg')}] CLOSED {d.get('reason')} "
-                      f"rung=T{d.get('rung',0)} PnL=₹{pnl:+,.0f}")
+                      f"rung=T{d.get('rung',0)}  TRADE TOTAL ₹{pnl:+,.0f}{detail}")
+        elif ev == "feed_blind":
+            m = d.get("seconds", 0) / 60
+            self._log(f"🚫 NO CANDLES FOR {m:.0f} MIN — strategy is blind and "
+                      f"cannot signal. See the terminal log for the cause.")
+            self.lbl_status.configure(text="● NO DATA", text_color=RED)
+        elif ev == "stale_signal":
+            self._log(f"⏳ [{d.get('leg')}] signal at {d.get('time')} ignored — "
+                      f"bar was {d.get('age',0):.0f}s old, not tradeable")
+        elif ev == "suspended":
+            self._log(f"⚡ App was not running for {d.get('seconds',0):.0f}s "
+                      f"(power cut or sleep). Late bars will be ignored.")
         elif ev == "halted":
             self._log(f"🛑 HALTED — {d.get('reason')}")
             self.lbl_status.configure(text="● HALTED", text_color=RED)

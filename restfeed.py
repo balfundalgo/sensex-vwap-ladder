@@ -63,13 +63,17 @@ class RestCandleFeed:
                  on_bar: Callable, period: int = 2, poll: float = 4.0,
                  grace: float = 6.0, agg_mode: str = "count", days: int = 10,
                  on_latency: Optional[Callable] = None,
-                 session_anchor: Optional[int] = None):
+                 session_anchor: Optional[int] = None,
+                 on_blind: Optional[Callable] = None,
+                 blind_seconds: float = 300.0):
         self.legs = dict(legs)                  # {"CE": sec_id, "PE": sec_id}
         self.fetch_1m = fetch_1m
         self.aggregate = aggregate_fn
         self.anchor_of = anchor_of
         self.on_bar = on_bar
         self.on_latency = on_latency
+        self.on_blind = on_blind
+        self.blind_seconds = blind_seconds
         self.period = period
         self.poll = poll
         self.grace = grace
@@ -98,6 +102,13 @@ class RestCandleFeed:
         self.late_bars = 0
         self.stalls = 0
         self.last_stall = 0.0
+        # A feed that returns nothing is worse than one that errors: the
+        # strategy simply stops signalling and looks idle. On 17-Sep it was
+        # blind for 27 minutes and the only clue was 907 error lines nobody
+        # was watching.
+        self.last_bar_at = time.time()
+        self.blind_since = 0.0
+        self._blind_warned = 0.0
         self.stall_seconds = 60.0
         # A socket-level timeout is not a guarantee: on 08-Sep a call sat for
         # 1249 seconds on a dead keep-alive connection despite a 12s read
@@ -168,7 +179,27 @@ class RestCandleFeed:
                     log.error(f"  [{leg}] poll BLOCKED for {took:.0f}s — the "
                               f"strategy was blind for that period. "
                               f"({self.stalls} stall(s) today)")
+            self._check_blind()
             self._stop.wait(self.poll)
+
+    def _check_blind(self):
+        """Announce a feed that has stopped delivering, rather than let it idle."""
+        quiet = time.time() - self.last_bar_at
+        if quiet < self.blind_seconds:
+            return
+        if not self.blind_since:
+            self.blind_since = self.last_bar_at
+        now = time.time()
+        if now - self._blind_warned > 120:
+            self._blind_warned = now
+            log.error(f"  NO CANDLES FOR {quiet / 60:.0f} MINUTES — the strategy "
+                      f"is blind and cannot signal. Check the log above for the "
+                      f"cause (expired token, network, or the market being shut).")
+            if self.on_blind:
+                try:
+                    self.on_blind(quiet)
+                except Exception:
+                    pass
 
     @staticmethod
     def drop_forming(raw: List[dict], now: float, minute: int = 60) -> List[dict]:
@@ -248,7 +279,14 @@ class RestCandleFeed:
                     self._suppressed += 1
                     self.late_bars += 1
 
+            self.last_bar_at = time.time()
+            self.blind_since = 0.0
             self._last_ts[leg] = b["ts"]
+            # Tell the strategy how old this bar was when it arrived. After a
+            # power cut the whole backlog lands at once, and a signal computed
+            # from a seven-minute-old candle must not be acted on as if it
+            # were current.
+            b["lag"] = lag
             self.on_bar(leg, b)
 
     def _members_per_bar(self, raw: List[dict], bars: List[dict]) -> List[int]:

@@ -239,6 +239,43 @@ check("but only one warning logged", len(warns), 1)
 check("every late bar is still counted", feed.health()["late_bars"], 20)
 _lg.disable(_lg.WARNING)
 
+print("\n[17] REGRESSION 17-Sep: a blind feed announces itself")
+# The token expired at 09:24. Every poll 401'd, no bars arrived, and the app
+# looked merely idle for 27 minutes while logging 907 identical errors.
+import logging as _l2
+_l2.disable(_l2.NOTSET)
+seen = []
+feed = RestCandleFeed(legs={"PE": "999"},
+                      fetch_1m=lambda sec, days=1: [],      # the 401 case
+                      aggregate_fn=aggregate, anchor_of=anchor_of,
+                      on_bar=lambda leg, b: None,
+                      period=2, poll=0.01, session_anchor=ANCHOR,
+                      on_blind=lambda secs: seen.append(secs),
+                      blind_seconds=1.0)
+real = time.time
+feed.last_bar_at = 1000.0
+time.time = lambda: 1000.0 + 400
+try:
+    feed._check_blind()
+finally:
+    time.time = real
+check("blind feed reported", len(seen), 1)
+check("reports how long it has been blind", int(seen[0]), 400)
+_l2.disable(_l2.WARNING)
+
+print("\n[18] A healthy feed never reports blindness")
+seen = []
+feed = RestCandleFeed(legs={"PE": "999"},
+                      fetch_1m=lambda sec, days=1: [],
+                      aggregate_fn=aggregate, anchor_of=anchor_of,
+                      on_bar=lambda leg, b: None,
+                      period=2, poll=0.01, session_anchor=ANCHOR,
+                      on_blind=lambda secs: seen.append(secs),
+                      blind_seconds=300.0)
+feed.last_bar_at = time.time()
+feed._check_blind()
+check("quiet feed stays quiet", len(seen), 0)
+
 print("\n" + ("ALL RESTFEED TESTS PASSED" if not FAILS
               else f"{len(FAILS)} FAILURES: {FAILS}"))
 sys.exit(1 if FAILS else 0)

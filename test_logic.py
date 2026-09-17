@@ -286,5 +286,75 @@ msgs = [str(m) for _, m in seen if m]
 check("once open, says it is reading the candle",
       any("reading" in m for m in msgs), msgs[:2])
 
+print("\n[11] REGRESSION 16-Sep: a stale bar must not arm a trigger")
+# After a power cut the backlog arrives at once. A bar that closed seven
+# minutes ago carries a high that is no longer a tradeable price.
+e11, leg11 = new_engine()
+freeze_atr(leg11, 10.0)
+e11._process_candle(leg11, candle(0, 100, 101, 99, 99, 1000))     # below, resets
+stale_bar = candle(1, 100, 110, 99, 108, 2000)
+stale_bar["lag"] = 407.0                                          # the real value
+e11._process_candle(leg11, stale_bar)
+check("stale bar did not arm", leg11.state == LegState.IDLE, leg11.state)
+check("eligibility NOT consumed — no order was placed", leg11.eligible, True)
+check("no attempt recorded", leg11.attempts == 0, leg11.attempts)
+
+# a current bar right after must still work
+fresh = candle(2, 100, 112, 99, 110, 2000)
+fresh["lag"] = 1.4
+e11._process_candle(leg11, fresh)
+check("a timely bar still arms", leg11.state == LegState.ARMED, leg11.state)
+check("trigger from the fresh bar", abs(leg11.trigger - 112.20) < 1e-9,
+      leg11.trigger)
+
+print("\n[12] The stale gate is load-bearing")
+e12, leg12 = new_engine()
+freeze_atr(leg12, 10.0)
+e12.config.max_signal_age = 1e9                # effectively disabled
+e12._process_candle(leg12, candle(0, 100, 101, 99, 99, 1000))
+sb = candle(1, 100, 110, 99, 108, 2000); sb["lag"] = 407.0
+e12._process_candle(leg12, sb)
+check("without the gate the stale bar DOES arm",
+      leg12.state == LegState.ARMED, leg12.state)
+
+print("\n[13] REGRESSION 17-Sep: an expired token recovers without a restart")
+import types as _ty
+import engine as _EE
+_save = (_EE.SESSION, _EE.DhanTokenManager, _EE.HEADERS.get("access-token"),
+         _EE._LAST_REAUTH)
+try:
+    _EE.DHAN_CLIENT_ID = "X"
+    _EE.HEADERS.update({"access-token": "OLD", "client-id": "X"})
+    _EE.WS_NEEDS_RECONNECT.clear()
+    _EE._LAST_REAUTH = 0.0
+    hits = {"n": 0}
+
+    class _R:
+        def __init__(self, c, t): self.status_code, self.text = c, t
+        def json(self): return {"ok": True}
+
+    def _post(url, headers=None, json=None, timeout=None):
+        hits["n"] += 1
+        if headers.get("access-token") == "OLD":
+            return _R(401, '{"errorCode":"DH-901"}')
+        return _R(200, "{}")
+
+    _EE.SESSION = _ty.SimpleNamespace(post=_post)
+    _EE.DhanTokenManager = type("M", (), {"ensure_token": lambda self: "NEW"})
+
+    res = _EE.api_post("/charts/intraday", {}, retries=2, timeout=5)
+    check("the call succeeds after re-auth", res == {"ok": True}, res)
+    check("it retried rather than giving up", hits["n"] == 2, hits["n"])
+    check("the new token is in use", _EE.HEADERS["access-token"] == "NEW",
+          _EE.HEADERS["access-token"])
+    check("websocket flagged to reconnect", _EE.WS_NEEDS_RECONNECT.is_set(), True)
+    check("new WS_URL carries the new token", "token=NEW" in _EE.WS_URL, True)
+finally:
+    _EE.SESSION, _EE.DhanTokenManager = _save[0], _save[1]
+    if _save[2]:
+        _EE.HEADERS["access-token"] = _save[2]
+    _EE._LAST_REAUTH = _save[3]
+    _EE.WS_NEEDS_RECONNECT.clear()
+
 print("\n" + ("ALL TESTS PASSED" if not FAILS else f"{len(FAILS)} FAILURES: {FAILS}"))
 sys.exit(1 if FAILS else 0)

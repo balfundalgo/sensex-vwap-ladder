@@ -49,6 +49,67 @@ N=14 needs ~200 prior bars before the starting point stops mattering. We seed
 with 300 and log the residual at start-up; if it is above 1e-4 the ATR will not
 match the terminal and the log says so.
 
+## The token expires mid-session — recover, do not wait to be restarted
+
+17-Sep: the token verified fine at 08:50 and expired at **09:24**, twenty-six
+minutes into the session. Every poll after that returned `HTTP 401 DH-901`.
+907 identical error lines, no candles, no signals. The app was not idle, it was
+blind, and it had no way to say so. The client stopped and started it at 09:51
+and it worked instantly — because startup re-authenticates.
+
+The token manager already knew how to recover (verify → renew → TOTP). It just
+only ran at startup. Now:
+
+* any `401`, `403`, `DH-901` or `DH-906` triggers `reauthenticate()` in place
+  and the call is retried immediately
+* it is serialised and rate-limited to 40s, since every failing poll will call
+  it and a TOTP window is only 30 seconds
+* the **websocket URL embeds the token**, so a re-auth rebuilds it and forces
+  the socket to reconnect — otherwise LTP keeps running on a dead credential
+* repeated identical API errors log once a minute with a suppressed count,
+  instead of 907 lines
+
+**And a blind feed now announces itself.** No candles for five minutes during
+market hours logs an error and turns the status bar to **NO DATA**. Silence
+should never look the same as "no setups today".
+
+## Power cuts, sleep, and stale signals
+
+The client's machine lost power mid-session on 10-Sep and 16-Sep. The app
+cannot prevent that, but it must not trade its way out of it.
+
+**A gap is named, not inferred.** The monitor loop ticks once a second; if far
+more wall clock than that has passed, the process was not running. It now says
+so outright. Previously this had to be worked out from log lines that were
+*absent* — the websocket watchdog reporting "no tick for 1874s" when it checks
+every 10 seconds proved it had not run, which is a poor way to learn the
+machine went off.
+
+**A stale bar cannot arm a trigger.** When power returns the whole backlog
+arrives at once. A bar that closed seven minutes ago carries a high that is no
+longer a tradeable price — and the next tick, carrying the *current* price,
+would fill it instantly at a level never available. In paper that books
+fictitious profit; live, the limit would miss, the market fallback would fill
+far away, and the stop and ladder would be computed from a price never traded.
+
+Bars older than `max_signal_age` (90s) are ignored for signalling. Eligibility
+is **not** consumed, because no order was placed. On 16-Sep a 407-second-old
+bar did arm; it was cancelled a second later only because the next backlogged
+bar arrived immediately. That was luck.
+
+## Per-lot P&L is not trade P&L
+
+The trade log shows both, and they are different units:
+
+```
+T1 sold 1 lot @ 363.34   this lot +1,230
+T2 sold 1 lot @ 424.83   this lot +2,460
+CLOSED TRAIL_T2  rung=T2  TRADE TOTAL +4,919  = +3,689 scaled + +1,230 final
+```
+
+Adding every number on screen gives +8,609 for a trade that made +4,919. The
+labels and the breakdown exist so the relationship is visible on the line.
+
 ## Nothing from a previous session may reach the strategy
 
 Two independent guards, because on 08-Sep this went wrong and every downstream

@@ -344,6 +344,60 @@ class DhanTokenManager:
         except Exception: pass
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# MID-SESSION RE-AUTHENTICATION
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# 17-Sep: the token was verified fine at 08:50 and expired at 09:24, twenty-six
+# minutes into the session. Every poll after that returned HTTP 401 DH-901.
+# 907 identical errors, no candles, no signals — and no way for the app to say
+# it had gone blind. The client restarted at 09:51 and it worked immediately,
+# because startup re-authenticates.
+#
+# The token manager already knows how to recover (verify -> renew -> TOTP). It
+# simply only ran at startup. Now any 401 triggers it in place.
+
+_AUTH_LOCK = threading.Lock()
+_LAST_REAUTH = 0.0
+REAUTH_COOLDOWN = 40.0          # a TOTP window is 30s; do not hammer it
+WS_NEEDS_RECONNECT = threading.Event()
+AUTH_FAILED = threading.Event()
+
+
+def reauthenticate(reason: str = "") -> bool:
+    """
+    Get a fresh token mid-session and rewire everything that holds one.
+
+    Returns True if the token changed. Serialised and rate-limited, because
+    every poll that 401s will call this and the TOTP window is 30 seconds.
+    """
+    global _LAST_REAUTH, DHAN_ACCESS_TOKEN
+    with _AUTH_LOCK:
+        if time.time() - _LAST_REAUTH < REAUTH_COOLDOWN:
+            return False            # another thread just did it
+        _LAST_REAUTH = time.time()
+        log.warning(f"  TOKEN REJECTED ({reason}) — re-authenticating in place")
+        try:
+            token = DhanTokenManager().ensure_token()
+        except Exception as e:
+            AUTH_FAILED.set()
+            log.error(f"  Re-authentication FAILED: {e}. The app cannot fetch "
+                      f"candles until this is resolved.")
+            return False
+        DHAN_ACCESS_TOKEN = token
+        HEADERS.update({"Content-Type": "application/json",
+                        "access-token": token, "client-id": DHAN_CLIENT_ID})
+        # The websocket URL embeds the token, so the existing socket is now
+        # running on a dead credential and has to be rebuilt too.
+        globals()["WS_URL"] = (f"wss://api-feed.dhan.co?version=2"
+                               f"&token={token}&clientId={DHAN_CLIENT_ID}"
+                               f"&authType=2")
+        WS_NEEDS_RECONNECT.set()
+        AUTH_FAILED.clear()
+        log.info("  Re-authenticated. New token in use; websocket will reconnect.")
+        return True
+
+
 def set_credentials(cid, pin, totp, token=""):
     global DHAN_CLIENT_ID, DHAN_PIN, DHAN_TOTP_SECRET, DHAN_ACCESS_TOKEN
     DHAN_CLIENT_ID = cid; DHAN_PIN = pin
@@ -482,6 +536,22 @@ def _hdrs():
 SLOW_CALL_SECONDS = 3.0     # anything above this is worth knowing about
 
 
+_ERR_SEEN = {}
+
+
+def _log_api_error(endpoint: str, code: int, body: str):
+    """One line a minute per endpoint+code, with a count of what it hid."""
+    key = (endpoint, code)
+    now = time.time()
+    last, hidden = _ERR_SEEN.get(key, (0.0, 0))
+    if now - last > 60:
+        extra = f"  ({hidden} identical suppressed)" if hidden else ""
+        log.error(f"  API {endpoint} -> HTTP {code}: {body[:160]}{extra}")
+        _ERR_SEEN[key] = (now, 0)
+    else:
+        _ERR_SEEN[key] = (last, hidden + 1)
+
+
 def api_post(endpoint, payload, retries=2, timeout=15):
     """
     POST with rate gating, retries, and timing.
@@ -509,7 +579,15 @@ def api_post(endpoint, payload, retries=2, timeout=15):
             if r.status_code == 429:
                 log.warning(f"  API {endpoint} rate limited, backing off")
                 time.sleep(2 ** (att + 1)); continue
-            log.error(f"  API {endpoint} -> HTTP {r.status_code}: {r.text[:200]}")
+            body = r.text or ""
+            if (r.status_code in (401, 403) or "DH-901" in body
+                    or "DH-906" in body):
+                if reauthenticate(f"HTTP {r.status_code} on {endpoint}"):
+                    continue        # retry straight away with the new token
+                _log_api_error(endpoint, r.status_code, body)
+                time.sleep(2.0)
+                continue
+            _log_api_error(endpoint, r.status_code, body)
             if att < retries: time.sleep(1.5)
         except requests.exceptions.Timeout:
             log.error(f"  API {endpoint} TIMED OUT after {timeout}s "
@@ -839,6 +917,7 @@ class StrategyConfig:
     rest_grace: float = 6.0           # declare a bar closed this long after
     ws_silence_seconds: float = 90.0  # force a reconnect after this much quiet
     open_countdown_seconds: float = 120.0   # how often to report the wait
+    max_signal_age: float = 90.0      # refuse to arm on a bar older than this
     atr_method: str = "wilder"        # "wilder" (ChartIQ Math) | "sma"
     rung_atr_mult: float = 2.0        # Tn = E + 2*ATR*n
     cost_plus: float = 2.00           # stop after T1 = E + 2
@@ -1182,6 +1261,7 @@ class SensexVWAPLadderEngine:
                 datetime.fromtimestamp(_normalize_epoch(ts), tz=IST)),
             on_bar=self._on_rest_bar,
             on_latency=self._on_rest_latency,
+            on_blind=lambda secs: self._emit("feed_blind", {"seconds": secs}),
             period=2, poll=self.config.rest_poll,
             grace=self.config.rest_grace, agg_mode=self.config.agg_mode,
             session_anchor=session_anchor_epoch())
@@ -1295,6 +1375,27 @@ class SensexVWAPLadderEngine:
         if self.config.first_candle_can_signal is False and bkt == 0:
             return
         if not self._entry_window_open(c["ts"]):
+            return
+
+        # A bar that reached us long after it closed describes a market that
+        # has already moved on. Arming from it would place a trigger at a
+        # stale price, and the very next tick — carrying the CURRENT price —
+        # would fill it instantly at a level that was never available.
+        #
+        # 16-Sep: after a power cut, a bar 407s old fired a signal. It was
+        # cancelled a second later only because the next backlogged bar
+        # arrived immediately. That was luck, not protection.
+        #
+        # Eligibility is NOT consumed: no order was placed, so this was not an
+        # attempt. The leg stays ready for the next genuinely current close.
+        age = float(c.get("lag") or 0.0)
+        if not replay and age > self.config.max_signal_age:
+            log.warning(f"  [{leg.label}] SIGNAL @ "
+                        f"{epoch_to_ist(c['ts'], '%H:%M')} IGNORED — the bar "
+                        f"arrived {age:.0f}s after it closed, so its high is no "
+                        f"longer a tradeable trigger. Leg stays eligible.")
+            self._emit("stale_signal", {"leg": leg.name, "age": age,
+                                        "time": epoch_to_ist(c["ts"], "%H:%M")})
             return
 
         self._arm(leg, c, vwap, replay)
@@ -1500,7 +1601,9 @@ class SensexVWAPLadderEngine:
         self.closed.append({"trade_id": pos.trade_id, "leg": leg.name,
                             "pnl": pos.realised, "reason": reason})
         self._emit("trade_closed", {"leg": leg.name, "pnl": pos.realised,
-                                    "reason": reason, "rung": pos.highest_rung})
+                                    "reason": reason, "rung": pos.highest_rung,
+                                    "last_leg_pnl": pnl_val,
+                                    "scaled": pos.realised - pnl_val})
         leg.position = None
         self._check_daily_loss()
 
@@ -1657,6 +1760,17 @@ class SensexVWAPLadderEngine:
             if self.stop_event.is_set() or self._halted:
                 continue
             t = now_ist().time()
+            if WS_NEEDS_RECONNECT.is_set():
+                WS_NEEDS_RECONNECT.clear()
+                log.info("  Reconnecting the websocket with the new token.")
+                self.last_tick_at = time.time()
+                try:
+                    if self.ws:
+                        self.ws.close()
+                except Exception:
+                    pass
+                continue
+
             if not (hhmm("09:15") <= t <= hhmm("15:30")):
                 continue
             if not self.last_tick_at:
@@ -1752,8 +1866,24 @@ class SensexVWAPLadderEngine:
             self._emit("error", {"msg": "WebSocket failed"}); return
         self._emit("status", {"msg": "LIVE — Monitoring"})
 
+        last_beat = time.time()
         while not self.stop_event.is_set():
             try:
+                # This loop ticks once a second. If far more than a second of
+                # wall clock has passed, the process was not running — a power
+                # cut, sleep or hibernate. Say so plainly: on 10-Sep and
+                # 16-Sep this had to be inferred from log lines that were
+                # absent, which is a poor way to learn your machine went off.
+                beat = time.time()
+                gap = beat - last_beat
+                last_beat = beat
+                if gap > 60:
+                    log.error(f"  GAP OF {gap:.0f}s — the application was not "
+                              f"running. Power cut, sleep or hibernate. Bars "
+                              f"from that period will arrive late and will be "
+                              f"ignored for signalling.")
+                    self._emit("suspended", {"seconds": gap})
+
                 self._check_square_off()
                 self._emit("tick_update", self.get_summary())
                 time.sleep(1)
@@ -1846,10 +1976,19 @@ def _console_monitor():
             print(f"     T{d['rung']} at {d['price']:.2f} -> stop {d['stop']:.2f}")
         elif event == "scale_out":
             print(f"     {d['tag']} sold 1 lot at {d['price']:.2f}  "
-                  f"pnl {d['pnl']:+,.0f}  ({d['lots_left']} left)")
+                  f"this lot {d['pnl']:+,.0f}  ({d['lots_left']} left)")
         elif event == "trade_closed":
+            sc = d.get("scaled", 0)
+            extra = (f"  = {sc:+,.0f} scaled + {d.get('last_leg_pnl', 0):+,.0f} final"
+                     if abs(sc) > 0.005 else "")
             print(f"\n  >> [{d['leg']}] CLOSED {d['reason']} at rung T{d['rung']}"
-                  f"  pnl {d['pnl']:+,.0f}\n")
+                  f"  TRADE TOTAL {d['pnl']:+,.0f}{extra}\n")
+        elif event == "stale_signal":
+            print(f"  >> [{d['leg']}] signal at {d['time']} ignored — bar was "
+                  f"{d['age']:.0f}s old")
+        elif event == "suspended":
+            print(f"\n  >> app was not running for {d['seconds']:.0f}s "
+                  f"(power cut or sleep)\n")
         elif event == "halted":
             print(f"\n  >> HALTED — {d.get('reason')}\n")
         elif event == "error":

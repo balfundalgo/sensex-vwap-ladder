@@ -134,6 +134,25 @@ check("leg card shows open P&L",
       "762" in win.leg_cards["PE"]["cells"]["upnl"].cget("text"),
       win.leg_cards["PE"]["cells"]["upnl"].cget("text"))
 
+print("\n[7d] Trade totals cannot be confused with per-lot lines")
+win._handle("scale_out", {"leg": "PE", "tag": "T1", "price": 363.34,
+                          "pnl": 1230, "lots_left": 2})
+win._handle("trade_closed", {"leg": "PE", "pnl": 4919, "reason": "TRAIL_T2",
+                             "rung": 2, "scaled": 3689, "last_leg_pnl": 1230})
+win.update()
+lg = win.trade_log.get("1.0", "end")
+check("per-lot line says 'this lot'", "this lot" in lg, True)
+check("closing line says TRADE TOTAL", "TRADE TOTAL" in lg, True)
+check("and shows the breakdown", "scaled" in lg and "final" in lg, True)
+
+print("\n[7e] Power cut and stale signal are surfaced")
+win._handle("suspended", {"seconds": 407})
+win._handle("stale_signal", {"leg": "CE", "age": 407, "time": "11:31"})
+win.update()
+lg = win.trade_log.get("1.0", "end")
+check("suspension reported", "was not running" in lg, True)
+check("stale signal reported", "not tradeable" in lg, True)
+
 print("\n[8] Config picks up the study settings")
 win.opt_field.set("hlc3"); win.opt_atrm.set("sma")
 cfg = win._build_config()
