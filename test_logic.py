@@ -356,5 +356,47 @@ finally:
     _EE._LAST_REAUTH = _save[3]
     _EE.WS_NEEDS_RECONNECT.clear()
 
+print("\n[14] Equal thirds at each rung, whatever the size")
+for mult, want_lots, want_third in [(1, 3, 1), (2, 6, 2), (3, 9, 3)]:
+    cfg = StrategyConfig(paper_mode=True, lot_multiplier=mult)
+    e14 = SensexVWAPLadderEngine(cfg)
+    e14.lot_size = 20
+    lg = e14.legs["CE"]
+    lg.sec_id = "1"; lg.strike = 78300; lg.label = "CE"
+    lg.atr = WilderATR(14); lg.atr.value = 10.0
+    lg.atr.prev_close = 100.0; lg.atr_ok = True
+    e14.by_sec["1"] = lg
+    e14._fill_window_open = lambda: True
+    freeze_atr(lg, 10.0)
+    e14._process_candle(lg, candle(0, 100, 102, 99, 100, 1000))
+    e14._process_candle(lg, candle(1, 100, 101, 99, 99.5, 2000))
+    e14._process_candle(lg, candle(2, 100, 110, 100, 108, 3000))
+    e14._on_tick(lg, 110.50)
+    pos = lg.position
+    check(f"x{mult} opens {want_lots} lots", pos.lots_open == want_lots,
+          pos.lots_open)
+    e14._on_tick(lg, 130.50)                      # T1
+    check(f"x{mult} books {want_third} at T1",
+          pos.lots_open == want_lots - want_third, pos.lots_open)
+    e14._on_tick(lg, 150.50)                      # T2
+    check(f"x{mult} books {want_third} at T2",
+          pos.lots_open == want_lots - 2 * want_third, pos.lots_open)
+    check(f"x{mult} leaves {want_third} running",
+          pos.lots_open == want_third, pos.lots_open)
+    e14._on_tick(lg, 120.00)                      # trail out
+    check(f"x{mult} runner exits", lg.position is None, lg.position)
+
+print("\n[15] Timeframe reaches the bucketing and the entry window")
+for tf in (1, 2, 5, 15):
+    c = StrategyConfig(timeframe_minutes=tf)
+    check(f"{tf}m -> {tf*60}s", c.tf_seconds == tf * 60, c.tf_seconds)
+    e15 = SensexVWAPLadderEngine(c)
+    # a bar closing exactly at 14:45 is allowed; one closing later is not
+    ok_ts = ANCHOR + (14 * 60 + 45 - 9 * 60 - 15) * 60 - c.tf_seconds
+    late_ts = ok_ts + c.tf_seconds
+    check(f"{tf}m: bar closing 14:45 arms", e15._entry_window_open(ok_ts), True)
+    check(f"{tf}m: the next one does not",
+          not e15._entry_window_open(late_ts), True)
+
 print("\n" + ("ALL TESTS PASSED" if not FAILS else f"{len(FAILS)} FAILURES: {FAILS}"))
 sys.exit(1 if FAILS else 0)

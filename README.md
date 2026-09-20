@@ -110,6 +110,40 @@ CLOSED TRAIL_T2  rung=T2  TRADE TOTAL +4,919  = +3,689 scaled + +1,230 final
 Adding every number on screen gives +8,609 for a trade that made +4,919. The
 labels and the breakdown exist so the relationship is visible on the line.
 
+## Timeframe and position size
+
+**Timeframe** is selectable: 1, 2, 3, 5, 10 or 15 minutes (default 2). Candles
+are always built by rolling up 1-minute bars, at every timeframe — including 5
+and 15 where Dhan has a native interval. One code path, and it is the one
+reconciled against the chart; a native 5-minute bar and a rollup of five
+1-minute bars disagree whenever a minute is missing.
+
+Two things scale with it automatically:
+
+* **History requested.** Wilder needs ~300 *bars*, so 15-minute candles need
+  about twelve sessions where 2-minute needs two. `seed_days` scales rather
+  than sitting at a fixed 10.
+* **The stale-signal limit.** Was a flat 90s, which is most of a candle at
+  1 minute and needlessly strict at 15. Now a quarter of the timeframe, floored
+  at 20s.
+
+**Size** is entered as a multiplier of 3, so the ladder always divides evenly:
+
+```
+you type 1  ->  3 lots  ->  1 at T1 · 1 at T2 · 1 runner
+you type 2  ->  6 lots  ->  2 at T1 · 2 at T2 · 2 runner
+you type 3  ->  9 lots  ->  3 at T1 · 3 at T2 · 3 runner
+```
+
+The GUI shows the arithmetic under the field and updates as you type, because
+"Lots ×3" is not self-explanatory and a client who types 2 expecting two lots
+would have a bad day.
+
+**Locked and no longer in the GUI:** ATR method (Wilder), rollup (bar count),
+candle source (REST). All three were reconciled against the chart. Only the
+VWAP field stays adjustable, since the chart's own setting varies. The console
+runner still exposes all of them.
+
 ## Nothing from a previous session may reach the strategy
 
 Two independent guards, because on 08-Sep this went wrong and every downstream

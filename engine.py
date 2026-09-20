@@ -751,17 +751,28 @@ def fetch_intraday_1m(security_id, segment, instrument, days=6) -> List[dict]:
     return out
 
 
-def aggregate_2m(candles_1m: List[dict], mode: str = "count") -> List[dict]:
+def aggregate_tf(candles_1m: List[dict], minutes: int = 2,
+                 mode: str = "count") -> List[dict]:
     """
-    Roll Dhan's 1-minute bars into the 2-minute bars the chart draws.
+    Roll Dhan's 1-minute bars into `minutes`-minute bars.
 
-    mode="count" groups every 2 SURVIVING bars, which is what ChartIQ (and so
-    Kite) does — gaps are collapsed, not preserved. mode="clock" buckets by
-    wall clock instead. They agree only when no minute is missing.
+    Always built from 1-minute source, at every timeframe — even 5 and 15
+    where Dhan has a native interval. One code path, and it is the one
+    reconciled against the chart. A native 5-minute bar and a rollup of five
+    1-minute bars disagree whenever a minute is missing, and carrying both
+    would mean verifying both.
+
+    mode="count" groups every `minutes` SURVIVING bars, which is what ChartIQ
+    (and so the broker's chart) does — gaps are collapsed, not preserved.
     """
-    return aggregate(candles_1m, period=2, mode=mode,
+    return aggregate(candles_1m, period=int(minutes), mode=mode,
                      anchor_of=lambda ts: session_anchor_epoch(
                          datetime.fromtimestamp(_normalize_epoch(ts), tz=IST)))
+
+
+def aggregate_2m(candles_1m: List[dict], mode: str = "count") -> List[dict]:
+    """Back-compat shim for the reconciliation tools."""
+    return aggregate_tf(candles_1m, 2, mode)
 
 
 def get_sensex_open_0915() -> Optional[float]:
@@ -911,17 +922,60 @@ class StrategyConfig:
     stop_buffer: float = 1.00         # below signal candle low
     atr_period: int = 14
     vwap_field: str = "ohlc4"         # must match the label on his chart
+    # Locked: these were reconciled against the chart and are no longer
+    # exposed in the GUI. Still overridable from the console runner.
     agg_mode: str = "count"           # "count" = ChartIQ/Kite | "clock"
     data_source: str = "rest"         # "rest" (verified path) | "websocket"
     rest_poll: float = 4.0            # seconds between REST polls
     rest_grace: float = 6.0           # declare a bar closed this long after
     ws_silence_seconds: float = 90.0  # force a reconnect after this much quiet
     open_countdown_seconds: float = 120.0   # how often to report the wait
-    max_signal_age: float = 90.0      # refuse to arm on a bar older than this
+    max_signal_age: float = 0.0       # 0 = derive from the timeframe
+
+    # ─── derived ───
+
+    @property
+    def lots(self) -> int:
+        """Lots actually traded. The multiplier keeps this divisible by 3."""
+        return max(3, int(self.lot_multiplier) * 3)
+
+    @property
+    def tf_seconds(self) -> int:
+        return int(self.timeframe_minutes) * 60
+
+    @property
+    def signal_age_limit(self) -> float:
+        """
+        How stale a bar may be and still arm a trigger.
+
+        Was a flat 90s, chosen because a 2-minute order window is 120s. That
+        is useless on a 1-minute chart (90s is most of a candle) and needlessly
+        strict on 15-minute. Scale it: a quarter of the timeframe, never below
+        20s.
+        """
+        if self.max_signal_age > 0:
+            return self.max_signal_age
+        return max(20.0, self.tf_seconds * 0.25)
+
+    @property
+    def seed_days(self) -> int:
+        """
+        Days of 1-minute history to request.
+
+        Wilder needs roughly 300 BARS to converge, and a bar is timeframe
+        minutes long. At 15 minutes that is 4,500 trading minutes — about
+        twelve sessions. Ten days is plenty at 2 minutes and nowhere near
+        enough at 15, so scale the request.
+        """
+        bars_needed = max(300, self.atr_seed_bars)
+        minutes = bars_needed * self.timeframe_minutes
+        sessions = minutes / 375.0          # 09:15-15:30
+        return max(10, int(sessions * 1.6) + 2)   # weekends and holidays
     atr_method: str = "wilder"        # "wilder" (ChartIQ Math) | "sma"
     rung_atr_mult: float = 2.0        # Tn = E + 2*ATR*n
     cost_plus: float = 2.00           # stop after T1 = E + 2
-    lots: int = 3
+    timeframe_minutes: int = 2        # 1, 2, 3, 5, 10 or 15
+    lot_multiplier: int = 1           # actual lots = multiplier x 3
     last_entry: str = "14:45"
     square_off: str = "15:00"
     atr_seed_bars: int = 300          # Wilder needs ~200 bars to converge
@@ -944,6 +998,7 @@ class Position:
     initial_stop: float
     lots_open: int
     lot_size: int
+    lots_at_entry: int = 0
     highest_rung: int = 0
     opened_at: float = field(default_factory=time.time)
     entry_order_id: str = ""
@@ -1162,7 +1217,8 @@ class SensexVWAPLadderEngine:
     def _seed_leg(self, leg: Leg):
         """Seed the continuous ATR from prior-session candles (spec 3.1)."""
         log.info(f"  Seeding indicators: {leg.label}...")
-        raw = fetch_intraday_1m(leg.sec_id, SENSEX["segment"], "OPTIDX", days=10)
+        raw = fetch_intraday_1m(leg.sec_id, SENSEX["segment"], "OPTIDX",
+                                days=self.config.seed_days)
 
         # Dhan serves the minute that is still building. If it survives into
         # the seed, the last replayed 2-minute bar is built from a half-formed
@@ -1177,7 +1233,8 @@ class SensexVWAPLadderEngine:
             log.info(f"  [{leg.label}] excluded {n_raw - len(raw)} still-forming "
                      f"minute(s) from the seed")
 
-        c2 = aggregate_2m(raw, self.config.agg_mode)
+        c2 = aggregate_tf(raw, self.config.timeframe_minutes,
+                          self.config.agg_mode)
 
         anchor = session_anchor_epoch()
         prior = [c for c in c2 if c["ts"] < anchor]
@@ -1219,7 +1276,7 @@ class SensexVWAPLadderEngine:
             log.info(f"  [{leg.label}] Session-only ATR now valid: {leg.atr.value:.2f}")
 
         if self.config.data_source == "websocket":
-            ce = CandleEngine(leg.sec_id, leg.label, 120,
+            ce = CandleEngine(leg.sec_id, leg.label, self.config.tf_seconds,
                               on_close=self._on_candle_close)
             self.candle_engines[leg.sec_id] = ce
         leg.seeded_upto = today[-1]["ts"] if today else 0
@@ -1262,7 +1319,7 @@ class SensexVWAPLadderEngine:
             on_bar=self._on_rest_bar,
             on_latency=self._on_rest_latency,
             on_blind=lambda secs: self._emit("feed_blind", {"seconds": secs}),
-            period=2, poll=self.config.rest_poll,
+            period=self.config.timeframe_minutes, poll=self.config.rest_poll,
             grace=self.config.rest_grace, agg_mode=self.config.agg_mode,
             session_anchor=session_anchor_epoch())
         for name, leg in self.legs.items():
@@ -1312,7 +1369,7 @@ class SensexVWAPLadderEngine:
         if not leg.atr_ok and atr is not None:
             leg.atr_ok = True
 
-        bkt = bucket_of(c["ts"])
+        bkt = bucket_of(c["ts"], self.config.tf_seconds)
         tstr = epoch_to_ist(c["ts"], "%H:%M")
 
         if not replay:
@@ -1389,7 +1446,7 @@ class SensexVWAPLadderEngine:
         # Eligibility is NOT consumed: no order was placed, so this was not an
         # attempt. The leg stays ready for the next genuinely current close.
         age = float(c.get("lag") or 0.0)
-        if not replay and age > self.config.max_signal_age:
+        if not replay and age > self.config.signal_age_limit:
             log.warning(f"  [{leg.label}] SIGNAL @ "
                         f"{epoch_to_ist(c['ts'], '%H:%M')} IGNORED — the bar "
                         f"arrived {age:.0f}s after it closed, so its high is no "
@@ -1403,11 +1460,13 @@ class SensexVWAPLadderEngine:
     def _entry_window_open(self, ts) -> bool:
         """
         Spec 8: the signal candle must CLOSE at or before 14:45, and the trigger
-        must fill by 14:45. `ts` is the bucket start, so the close is ts + 120.
-        A candle closing at 14:44 may arm; the order then lives into the
-        14:44-14:46 candle but can only fill while the clock is <= 14:45.
+        must fill by 14:45. `ts` is the bucket start, so the close is one
+        timeframe later. A candle closing at 14:44 may arm; the order then
+        lives into the next candle but can only fill while the clock is
+        <= 14:45.
         """
-        close_t = datetime.fromtimestamp(_normalize_epoch(int(ts)) + 120, tz=IST).time()
+        close_t = datetime.fromtimestamp(
+            _normalize_epoch(int(ts)) + self.config.tf_seconds, tz=IST).time()
         return close_t <= hhmm(self.config.last_entry)
 
     def _fill_window_open(self) -> bool:
@@ -1441,7 +1500,7 @@ class SensexVWAPLadderEngine:
         leg.signal_candle["atr"] = leg.atr.value
         leg.trigger = trigger
         leg.pending_stop = stop
-        leg.armed_bucket = bucket_of(c["ts"])
+        leg.armed_bucket = bucket_of(c["ts"], self.config.tf_seconds)
         leg.state = LegState.ARMED
 
         if not replay:
@@ -1505,7 +1564,7 @@ class SensexVWAPLadderEngine:
             fill_price=fill_price,
             atr_frozen=float(sig.get("atr") or leg.atr.value or 0),
             stop=leg.pending_stop, initial_stop=leg.pending_stop,
-            lots_open=cfg.lots, lot_size=self.lot_size,
+            lots_open=cfg.lots, lots_at_entry=cfg.lots, lot_size=self.lot_size,
             entry_order_id=oid, signal=sig)
 
         leg.position = pos
@@ -1513,9 +1572,12 @@ class SensexVWAPLadderEngine:
         leg.trades += 1
 
         icon = "PAPER" if cfg.paper_mode else "LIVE"
-        log.info(f"  [{leg.label}] ENTRY ({icon}) {cfg.lots} lots x {self.lot_size} "
-                 f"@ E={pos.E:.2f} fill={fill_price:.2f} stop={pos.stop:.2f} "
-                 f"ATR={pos.atr_frozen:.2f}")
+        third = max(1, cfg.lots // 3)
+        log.info(f"  [{leg.label}] ENTRY ({icon}) {cfg.lots} lots x "
+                 f"{self.lot_size} = {qty} qty @ E={pos.E:.2f} "
+                 f"fill={fill_price:.2f} stop={pos.stop:.2f} "
+                 f"ATR={pos.atr_frozen:.2f} | {third} lots at each of T1, T2, "
+                 f"{cfg.lots - 2 * third} runner")
         self._emit("entry", {"leg": leg.name, "strike": leg.strike, "E": pos.E,
                              "fill": fill_price, "stop": pos.stop,
                              "atr": pos.atr_frozen, "qty": qty,
@@ -1554,10 +1616,24 @@ class SensexVWAPLadderEngine:
             leg.state = LegState.STOOD_DOWN     # a finished trade spends the attempt
 
     def _scale_out(self, leg: Leg, price: float, tag: str):
+        """
+        Book one third of the position at this rung.
+
+        The ladder has three parts — T1, T2 and the runner — so a scale-out is
+        always a third of what was opened, not a single lot. The multiplier
+        guarantees the total is divisible by 3, so there is never a remainder:
+
+            3 lots ->  1 at T1,  1 at T2,  1 runner
+            6 lots ->  2 at T1,  2 at T2,  2 runner
+            9 lots ->  3 at T1,  3 at T2,  3 runner
+        """
         pos = leg.position
-        if not pos or pos.lots_open <= 1:
+        if not pos:
             return
-        qty = self.lot_size
+        lots_to_book = max(1, pos.lots_at_entry // 3)
+        if pos.lots_open <= lots_to_book:
+            return              # only the runner is left; it exits on the stop
+        qty = lots_to_book * self.lot_size
         exit_price = price
         oid = "PAPER"
         if not self.config.paper_mode:
@@ -1571,14 +1647,17 @@ class SensexVWAPLadderEngine:
                 return
         pnl_pts = exit_price - pos.E
         pnl_val = pnl_pts * qty
-        pos.lots_open -= 1
+        pos.lots_open -= lots_to_book
         pos.realised += pnl_val
         leg.pnl += pnl_val
         self._log_lot(leg, pos, exit_price, qty, pnl_pts, pnl_val, tag, oid)
-        log.info(f"  [{leg.label}] {tag} sold 1 lot @ {exit_price:.2f} "
+        word = "lot" if lots_to_book == 1 else "lots"
+        log.info(f"  [{leg.label}] {tag} sold {lots_to_book} {word} "
+                 f"({qty} qty) @ {exit_price:.2f} "
                  f"PnL=Rs.{pnl_val:+,.0f} ({pos.lots_open} lots left)")
         self._emit("scale_out", {"leg": leg.name, "tag": tag, "price": exit_price,
-                                 "pnl": pnl_val, "lots_left": pos.lots_open})
+                                 "pnl": pnl_val, "lots_left": pos.lots_open,
+                                 "lots_sold": lots_to_book, "qty": qty})
 
     def _exit_all(self, leg: Leg, price: float, reason: str):
         pos = leg.position
@@ -1975,8 +2054,10 @@ def _console_monitor():
         elif event == "rung":
             print(f"     T{d['rung']} at {d['price']:.2f} -> stop {d['stop']:.2f}")
         elif event == "scale_out":
-            print(f"     {d['tag']} sold 1 lot at {d['price']:.2f}  "
-                  f"this lot {d['pnl']:+,.0f}  ({d['lots_left']} left)")
+            n = d.get("lots_sold", 1)
+            print(f"     {d['tag']} sold {n} lot{'' if n == 1 else 's'} "
+                  f"({d.get('qty', 0)} qty) at {d['price']:.2f}  "
+                  f"these lots {d['pnl']:+,.0f}  ({d['lots_left']} left)")
         elif event == "trade_closed":
             sc = d.get("scaled", 0)
             extra = (f"  = {sc:+,.0f} scaled + {d.get('last_leg_pnl', 0):+,.0f} final"
@@ -2029,7 +2110,11 @@ def main():
     ap.add_argument("--atr-method", choices=["wilder", "sma"], default="wilder")
     ap.add_argument("--agg", choices=["count", "clock"], default="count")
     ap.add_argument("--poll", type=float, default=4.0)
-    ap.add_argument("--lots", type=int, default=3)
+    ap.add_argument("--tf", type=int, default=2,
+                    choices=[1, 2, 3, 5, 10, 15],
+                    help="candle timeframe in minutes")
+    ap.add_argument("--lots", type=int, default=1,
+                    help="multiplier: actual lots = this x 3")
     args = ap.parse_args()
 
     if not DHAN_CLIENT_ID or not DHAN_PIN or not DHAN_TOTP_SECRET:
@@ -2037,12 +2122,19 @@ def main():
 
     cfg = StrategyConfig(paper_mode=not args.live, data_source=args.source,
                          vwap_field=args.field, atr_method=args.atr_method,
-                         agg_mode=args.agg, rest_poll=args.poll, lots=args.lots)
+                         agg_mode=args.agg, rest_poll=args.poll,
+                         timeframe_minutes=args.tf,
+                         lot_multiplier=max(1, args.lots))
 
     print("=" * 100)
+    third = max(1, cfg.lots // 3)
     print(f"  SENSEX VWAP Ladder — {'LIVE ORDERS' if args.live else 'PAPER'}"
-          f"   candles={cfg.data_source}  vwap={cfg.vwap_field}  "
-          f"atr={cfg.atr_method}  rollup={cfg.agg_mode}  lots={cfg.lots}")
+          f"   {cfg.timeframe_minutes}m candles  vwap={cfg.vwap_field}  "
+          f"atr={cfg.atr_method}  rollup={cfg.agg_mode}")
+    print(f"  {args.lots} x 3 = {cfg.lots} lots   "
+          f"{third} at T1, {third} at T2, {third} runner   "
+          f"stale-signal limit {cfg.signal_age_limit:.0f}s   "
+          f"history {cfg.seed_days}d")
     print(f"  logs -> {LOG_DIR}")
     print("=" * 100)
     if args.live:

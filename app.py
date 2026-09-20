@@ -58,7 +58,8 @@ class SensexApp(ctk.CTk):
         self.engine = None; self.is_running = False
         self._saved_config = None
         self.candle_rows = []          # everything shown in the reconcile panel
-        self._build_ui(); self._load_env(); self._tick()
+        self._lot_size = 20            # replaced by the real one at start-up
+        self._build_ui(); self._load_env(); self._refresh_size_hint(); self._tick()
 
     # ═══════════ LAYOUT ═══════════
     def _build_ui(self):
@@ -129,47 +130,44 @@ class SensexApp(ctk.CTk):
         g = ctk.CTkFrame(p, fg_color="transparent"); g.pack(fill="x", padx=14, pady=2)
         self.ent_buf = self._gentry(g, "Entry buffer ₹", "0.20", 0)
         self.ent_sl = self._gentry(g, "Stop buffer ₹", "1.00", 1)
-        self.ent_lots = self._gentry(g, "Lots", "3", 2)
-        self.ent_slip = self._gentry(g, "Max slip ₹", "0", 3)
+        self.ent_slip = self._gentry(g, "Max slip ₹", "0", 2)
 
-        self._sec(p, "📐 STUDIES  (must match his chart)")
+        self._sec(p, "🕐 TIMEFRAME & SIZE")
         f = ctk.CTkFrame(p, fg_color="transparent"); f.pack(fill="x", padx=14, pady=3)
-        ctk.CTkLabel(f, text="VWAP field", font=FM, text_color=TXT, width=100,
+        ctk.CTkLabel(f, text="Candle", font=FM, text_color=TXT, width=100,
+                     anchor="w").pack(side="left")
+        self.opt_tf = ctk.CTkOptionMenu(
+            f, values=["1", "2", "3", "5", "10", "15"], font=FS, width=104,
+            height=26, fg_color=ACC, button_color=ACC, text_color="white",
+            command=lambda _v: self._refresh_size_hint())
+        self.opt_tf.set("2"); self.opt_tf.pack(side="left")
+        ctk.CTkLabel(f, text="min", font=FL, text_color=DIM).pack(side="left", padx=4)
+
+        f = ctk.CTkFrame(p, fg_color="transparent"); f.pack(fill="x", padx=14, pady=3)
+        ctk.CTkLabel(f, text="Lots  ×3", font=FM, text_color=TXT, width=100,
+                     anchor="w").pack(side="left")
+        self.ent_lots = ctk.CTkEntry(f, font=FS, fg_color="#fafbfc",
+                                     border_color=BD, text_color=TXT,
+                                     height=26, width=70)
+        self.ent_lots.insert(0, "1"); self.ent_lots.pack(side="left")
+        self.ent_lots.bind("<KeyRelease>", lambda _e: self._refresh_size_hint())
+        self.lbl_size = ctk.CTkLabel(p, text="", font=FT2, text_color=ACC,
+                                     wraplength=252, justify="left")
+        self.lbl_size.pack(anchor="w", padx=14, pady=(2, 0))
+
+        self._sec(p, "📐 VWAP FIELD")
+        f = ctk.CTkFrame(p, fg_color="transparent"); f.pack(fill="x", padx=14, pady=3)
+        ctk.CTkLabel(f, text="Field", font=FM, text_color=TXT, width=100,
                      anchor="w").pack(side="left")
         self.opt_field = ctk.CTkOptionMenu(f, values=["ohlc4", "hlc3", "hl2", "close"],
-                                           font=FS, width=100, height=26,
-                                           fg_color=ACC, button_color=ACC)
+                                           font=FS, width=104, height=26,
+                                           fg_color=ACC, button_color=ACC,
+                                           text_color="white")
         self.opt_field.set("ohlc4"); self.opt_field.pack(side="left")
-        f = ctk.CTkFrame(p, fg_color="transparent"); f.pack(fill="x", padx=14, pady=3)
-        ctk.CTkLabel(f, text="ATR method", font=FM, text_color=TXT, width=100,
-                     anchor="w").pack(side="left")
-        self.opt_atrm = ctk.CTkOptionMenu(f, values=["wilder", "sma"], font=FS,
-                                          width=100, height=26, fg_color=ACC,
-                                          button_color=ACC)
-        self.opt_atrm.set("wilder"); self.opt_atrm.pack(side="left")
-        f = ctk.CTkFrame(p, fg_color="transparent"); f.pack(fill="x", padx=14, pady=3)
-        ctk.CTkLabel(f, text="2m rollup", font=FM, text_color=TXT, width=100,
-                     anchor="w").pack(side="left")
-        self.opt_agg = ctk.CTkOptionMenu(f, values=["count", "clock"], font=FS,
-                                         width=104, height=26, fg_color=ACC,
-                                         button_color=ACC, text_color="white")
-        self.opt_agg.set("count"); self.opt_agg.pack(side="left")
-        f = ctk.CTkFrame(p, fg_color="transparent"); f.pack(fill="x", padx=14, pady=3)
-        ctk.CTkLabel(f, text="Candles from", font=FM, text_color=TXT, width=100,
-                     anchor="w").pack(side="left")
-        self.opt_src = ctk.CTkOptionMenu(f, values=["rest", "websocket"], font=FS,
-                                         width=104, height=26, fg_color=ACC,
-                                         button_color=ACC, text_color="white")
-        self.opt_src.set("rest"); self.opt_src.pack(side="left")
-        ctk.CTkLabel(p, text="rest = the path reconciled against the chart. The "
-                             "websocket carries LTP either way, for the trigger, "
-                             "stop and rungs.",
+        ctk.CTkLabel(p, text="Must match the VWAP source on the client's chart. "
+                             "ATR is Wilder and continuous; candles come from "
+                             "REST and roll up by bar count. Those are fixed.",
                      font=FT2, text_color=DIM, wraplength=252, justify="left"
-                     ).pack(anchor="w", padx=14, pady=(2, 0))
-        ctk.CTkLabel(p, text="ATR runs continuously across sessions and is "
-                             "seeded from prior days. These must match the "
-                             "study settings on the client's chart.",
-                     font=FT2, text_color=DIM, wraplength=250, justify="left"
                      ).pack(anchor="w", padx=14, pady=(2, 0))
 
         self._sec(p, "🪜 LADDER")
@@ -380,6 +378,26 @@ class SensexApp(ctk.CTk):
         self.ent_pin.insert(0, os.getenv("DHAN_PIN", ""))
         self.ent_totp.insert(0, os.getenv("DHAN_TOTP_SECRET", ""))
 
+    def _refresh_size_hint(self):
+        """
+        Spell out what the multiplier actually trades.
+
+        "Lots x3" is not self-explanatory, and a client who types 2 expecting
+        two lots and gets six has a very bad day. Show the arithmetic.
+        """
+        try:
+            mult = max(1, int(str(self.ent_lots.get()).strip() or "1"))
+        except ValueError:
+            self.lbl_size.configure(text="enter a whole number", text_color=RED)
+            return
+        lots = mult * 3
+        lot_size = getattr(self, "_lot_size", 20) or 20
+        third = lots // 3
+        self.lbl_size.configure(
+            text=(f"{mult} × 3 = {lots} lots = {lots * lot_size} qty\n"
+                  f"{third} at T1 · {third} at T2 · {third} runner"),
+            text_color=ACC)
+
     def _tick(self):
         self.lbl_clock.configure(text=now_ist().strftime("%H:%M:%S"))
         self.after(1000, self._tick)
@@ -413,6 +431,11 @@ class SensexApp(ctk.CTk):
             self.lbl_strike.configure(text=str(d.get("strike", "—")))
             self.lbl_expiry.configure(text=str(d.get("expiry", "—")))
             self.lbl_lot.configure(text=str(d.get("lot_size", "—")))
+            try:
+                self._lot_size = int(d.get("lot_size") or 20)
+                self._refresh_size_hint()
+            except (TypeError, ValueError):
+                pass
             self._log(f"09:15 open {d.get('open',0):.2f} → strike {d.get('strike')} "
                       f"| exp {d.get('expiry')} | lot {d.get('lot_size')}")
         elif ev == "waiting_for_open":
@@ -446,8 +469,10 @@ class SensexApp(ctk.CTk):
             self._log(f"   T{d.get('rung')} @ ₹{d.get('price',0):.2f} "
                       f"→ stop ₹{d.get('stop',0):.2f}")
         elif ev == "scale_out":
-            self._log(f"   {d.get('tag')} sold 1 lot @ ₹{d.get('price',0):.2f} "
-                      f"this lot ₹{d.get('pnl',0):+,.0f} "
+            n = d.get("lots_sold", 1)
+            self._log(f"   {d.get('tag')} sold {n} lot{'' if n == 1 else 's'} "
+                      f"({d.get('qty', 0)} qty) @ ₹{d.get('price',0):.2f} "
+                      f"these lots ₹{d.get('pnl',0):+,.0f} "
                       f"({d.get('lots_left')} left)")
         elif ev == "trade_closed":
             pnl = d.get("pnl", 0); icon = "✅" if pnl >= 0 else "❌"
@@ -540,8 +565,10 @@ class SensexApp(ctk.CTk):
         except Exception: return d
 
     def _i(self, e, d=0):
-        try: return int(e.get().strip())
-        except Exception: return d
+        try:
+            return int(str(e.get()).strip())
+        except Exception:
+            return d
 
     def _build_config(self):
         return StrategyConfig(
@@ -550,12 +577,10 @@ class SensexApp(ctk.CTk):
             stop_buffer=self._f(self.ent_sl, 1.00),
             atr_period=self._i(self.ent_atrp, 14),
             vwap_field=self.opt_field.get(),
-            atr_method=self.opt_atrm.get(),
-            agg_mode=self.opt_agg.get(),
-            data_source=self.opt_src.get(),
+            timeframe_minutes=self._i(self.opt_tf, 2),
+            lot_multiplier=max(1, self._i(self.ent_lots, 1)),
             rung_atr_mult=self._f(self.ent_mult, 2.0),
             cost_plus=self._f(self.ent_cost, 2.00),
-            lots=self._i(self.ent_lots, 3),
             last_entry=self.ent_le.get().strip() or "14:45",
             square_off=self.ent_so.get().strip() or "15:00",
             atr_seed_bars=self._i(self.ent_seed, 100),

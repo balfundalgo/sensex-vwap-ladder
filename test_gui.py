@@ -25,9 +25,13 @@ check("app constructed", win is not None)
 check("live candle panel exists", hasattr(win, "candle_box"))
 check("reconcile tooling removed", not hasattr(win, "btn_recon"), True)
 check("calibrate tooling removed", not hasattr(win, "cal_time"), True)
-check("study dropdowns exist", hasattr(win, "opt_field") and hasattr(win, "opt_atrm"))
+check("VWAP field dropdown kept", hasattr(win, "opt_field"))
 check("VWAP field defaults to ohlc4", win.opt_field.get() == "ohlc4", win.opt_field.get())
-check("ATR method defaults to wilder", win.opt_atrm.get() == "wilder", win.opt_atrm.get())
+check("ATR method control removed", not hasattr(win, "opt_atrm"), True)
+check("rollup control removed", not hasattr(win, "opt_agg"), True)
+check("candle-source control removed", not hasattr(win, "opt_src"), True)
+check("timeframe selector exists", hasattr(win, "opt_tf"))
+check("timeframe defaults to 2", win.opt_tf.get() == "2", win.opt_tf.get())
 check("ATR seed default is 300", win.ent_seed.get() == "300", win.ent_seed.get())
 
 print("\n[2] Live candles land in the table with VWAP and ATR")
@@ -136,14 +140,17 @@ check("leg card shows open P&L",
 
 print("\n[7d] Trade totals cannot be confused with per-lot lines")
 win._handle("scale_out", {"leg": "PE", "tag": "T1", "price": 363.34,
-                          "pnl": 1230, "lots_left": 2})
+                          "pnl": 1230, "lots_left": 2, "lots_sold": 2,
+                          "qty": 40})
 win._handle("trade_closed", {"leg": "PE", "pnl": 4919, "reason": "TRAIL_T2",
                              "rung": 2, "scaled": 3689, "last_leg_pnl": 1230})
 win.update()
 lg = win.trade_log.get("1.0", "end")
-check("per-lot line says 'this lot'", "this lot" in lg, True)
+check("per-lot line says 'these lots'", "these lots" in lg, True)
 check("closing line says TRADE TOTAL", "TRADE TOTAL" in lg, True)
 check("and shows the breakdown", "scaled" in lg and "final" in lg, True)
+check("scale-out names the lot count", "sold 2 lots" in lg, True)
+check("scale-out names the quantity", "(40 qty)" in lg, True)
 
 print("\n[7e] Power cut and stale signal are surfaced")
 win._handle("suspended", {"seconds": 407})
@@ -153,13 +160,32 @@ lg = win.trade_log.get("1.0", "end")
 check("suspension reported", "was not running" in lg, True)
 check("stale signal reported", "not tradeable" in lg, True)
 
+print("\n[7f] Lots multiplier is spelled out")
+for typed, lots, qty, third in [("1", 3, 60, 1), ("2", 6, 120, 2), ("3", 9, 180, 3)]:
+    win.ent_lots.delete(0, "end"); win.ent_lots.insert(0, typed)
+    win._refresh_size_hint(); win.update()
+    txt = win.lbl_size.cget("text")
+    check(f"typing {typed} shows {lots} lots",
+          f"= {lots} lots" in txt, txt)
+    check(f"typing {typed} shows {qty} qty", f"{qty} qty" in txt, txt)
+    check(f"typing {typed} splits {third} per rung",
+          f"{third} at T1 · {third} at T2 · {third} runner" in txt, txt)
+win.ent_lots.delete(0, "end"); win.ent_lots.insert(0, "1")
+win._refresh_size_hint()
+
 print("\n[8] Config picks up the study settings")
-win.opt_field.set("hlc3"); win.opt_atrm.set("sma")
+win.opt_field.set("hlc3"); win.opt_tf.set("5")
+win.ent_lots.delete(0, "end"); win.ent_lots.insert(0, "2")
 cfg = win._build_config()
 check("vwap_field wired", cfg.vwap_field == "hlc3", cfg.vwap_field)
-check("atr_method wired", cfg.atr_method == "sma", cfg.atr_method)
+check("timeframe wired", cfg.timeframe_minutes == 5, cfg.timeframe_minutes)
+check("multiplier becomes lots", cfg.lots == 6, cfg.lots)
+check("locked settings keep their defaults",
+      (cfg.atr_method, cfg.agg_mode, cfg.data_source) == ("wilder", "count", "rest"),
+      (cfg.atr_method, cfg.agg_mode, cfg.data_source))
 check("seed bars wired", cfg.atr_seed_bars == 300, cfg.atr_seed_bars)
 check("paper mode default on", cfg.paper_mode is True)
+win.opt_tf.set("2"); win.ent_lots.delete(0, "end"); win.ent_lots.insert(0, "1")
 
 print("\n[9] Other engine events still render")
 for ev, d in [("strike", {"open": 78111.0, "strike": 78100, "expiry": "2026-08-27",
