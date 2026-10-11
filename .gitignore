@@ -24,3 +24,4 @@ snx_daily_state.json
 # editors — .vscode IS committed on purpose, it is part of the dev setup
 .idea/
 .DS_Store
+last_lot_size.json

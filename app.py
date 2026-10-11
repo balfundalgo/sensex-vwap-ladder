@@ -484,6 +484,10 @@ class SensexApp(ctk.CTk):
                       if abs(scaled) > 0.005 else "")
             self._log(f"{icon} [{d.get('leg')}] CLOSED {d.get('reason')} "
                       f"rung=T{d.get('rung',0)}  TRADE TOTAL ₹{pnl:+,.0f}{detail}")
+        elif ev == "lot_size_changed":
+            self._log(f"⚠ LOT SIZE CHANGED {d.get('previous')} → {d.get('now')}. "
+                      f"Position value moves accordingly — verify against the "
+                      f"exchange circular.")
         elif ev == "feed_blind":
             m = d.get("seconds", 0) / 60
             self._log(f"🚫 NO CANDLES FOR {m:.0f} MIN — strategy is blind and "

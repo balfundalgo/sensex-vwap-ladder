@@ -173,6 +173,11 @@ for typed, lots, qty, third in [("1", 3, 60, 1), ("2", 6, 120, 2), ("3", 9, 180,
 win.ent_lots.delete(0, "end"); win.ent_lots.insert(0, "1")
 win._refresh_size_hint()
 
+print("\n[7g] A lot-size change is called out")
+win._handle("lot_size_changed", {"previous": 20, "now": 25})
+win.update()
+check("change reported", "LOT SIZE CHANGED" in win.trade_log.get("1.0", "end"), True)
+
 print("\n[8] Config picks up the study settings")
 win.opt_field.set("hlc3"); win.opt_tf.set("5")
 win.ent_lots.delete(0, "end"); win.ent_lots.insert(0, "2")

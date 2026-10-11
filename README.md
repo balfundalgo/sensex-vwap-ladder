@@ -110,6 +110,39 @@ CLOSED TRAIL_T2  rung=T2  TRADE TOTAL +4,919  = +3,689 scaled + +1,230 final
 Adding every number on screen gives +8,609 for a trade that made +4,919. The
 labels and the breakdown exist so the relationship is visible on the line.
 
+## Lot size comes from the contracts being traded
+
+The old lookup took the **first** OPTIDX row whose trading symbol **started
+with** "SENSEX" and returned its lot units. Two faults: the prefix also
+matches `SENSEX50`, and "first row" depends on however Dhan happened to order
+the CSV that morning.
+
+It returned 20 for five straight sessions and then **75 on 09-Oct-2026**,
+where the correct value for the 15-Oct expiry was 20. Every P&L that day was
+3.75x too large, and in live mode it would have sent **225 quantity where 60
+was intended**.
+
+The strike is different every morning, so nothing is cached. By the time the
+lot size is needed the option chain has already given us the exact security
+IDs of today's two legs, so they are matched exactly:
+
+```
+09:15:02  index open 71776.67        -> strike 71800
+09:15:02  option chain, 15-Oct       -> CE secId 889285, PE secId 889440
+09:15:02  master, exact id match     -> lot 20 on both
+```
+
+Lot size is a property of the underlying and expiry, not the strike, so:
+
+* **both legs must agree** — if they report different lot sizes the lookup is
+  wrong and the engine refuses to trade rather than sizing on a guess
+* **a missing id** falls back to the most common lot size across that
+  underlying and expiry, so one stray row cannot swing it the way "first
+  match" did; `SENSEX50` is excluded explicitly
+* **a change from the previous session is logged and shown** — BSE moves
+  SENSEX from 20 to 25 for January 2027 expiries from 30 October 2026, and
+  that should arrive as a warning rather than a silent 25% jump in size
+
 ## Timeframe and position size
 
 **Timeframe** is selectable: 1, 2, 3, 5, 10 or 15 minutes (default 2). Candles

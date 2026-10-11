@@ -398,5 +398,64 @@ for tf in (1, 2, 5, 15):
     check(f"{tf}m: the next one does not",
           not e15._entry_window_open(late_ts), True)
 
+print("\n[16] REGRESSION 09-Oct: lot size comes from the traded contracts")
+import engine as _E3
+_master = [
+ {"SEM_INSTRUMENT_NAME": "OPTIDX", "SEM_TRADING_SYMBOL": "SENSEX50 15 OCT 71800 CE",
+  "SEM_SMST_SECURITY_ID": "111111", "SEM_LOT_UNITS": "75",
+  "SEM_EXPIRY_DATE": "2026-10-15"},
+ {"SEM_INSTRUMENT_NAME": "OPTIDX", "SEM_TRADING_SYMBOL": "SENSEX 15 OCT 71800 CE",
+  "SEM_SMST_SECURITY_ID": "889285", "SEM_LOT_UNITS": "20",
+  "SEM_EXPIRY_DATE": "2026-10-15"},
+ {"SEM_INSTRUMENT_NAME": "OPTIDX", "SEM_TRADING_SYMBOL": "SENSEX 15 OCT 71800 PE",
+  "SEM_SMST_SECURITY_ID": "889440", "SEM_LOT_UNITS": "20",
+  "SEM_EXPIRY_DATE": "2026-10-15"},
+ {"SEM_INSTRUMENT_NAME": "OPTIDX", "SEM_TRADING_SYMBOL": "SENSEX 22 OCT 72000 CE",
+  "SEM_SMST_SECURITY_ID": "900001", "SEM_LOT_UNITS": "20",
+  "SEM_EXPIRY_DATE": "2026-10-22"},
+]
+_E3._MASTER_CACHE["rows"] = _master
+
+# the old rule, restated so the test fails if anyone reinstates it
+_old = next(r["SEM_LOT_UNITS"] for r in _master
+            if r["SEM_TRADING_SYMBOL"].upper().startswith("SENSEX"))
+check("the old prefix rule really did pick 75", _old == "75", _old)
+
+check("exact security-id lookup gives 20",
+      _E3.lot_size_for_security(["889285", "889440"]) == 20,
+      _E3.lot_size_for_security(["889285", "889440"]))
+check("SENSEX50 excluded from the expiry fallback",
+      _E3.lot_size_by_expiry("2026-10-15") == 20,
+      _E3.lot_size_by_expiry("2026-10-15"))
+check("a different expiry resolves on its own rows",
+      _E3.lot_size_by_expiry("2026-10-22") == 20,
+      _E3.lot_size_by_expiry("2026-10-22"))
+
+# tomorrow: different strike, different ids
+_master.append({"SEM_INSTRUMENT_NAME": "OPTIDX",
+                "SEM_TRADING_SYMBOL": "SENSEX 15 OCT 72500 PE",
+                "SEM_SMST_SECURITY_ID": "889999", "SEM_LOT_UNITS": "20",
+                "SEM_EXPIRY_DATE": "2026-10-15"})
+check("a different strike tomorrow resolves the same way",
+      _E3.lot_size_for_security(["889999"]) == 20,
+      _E3.lot_size_for_security(["889999"]))
+
+_master[2]["SEM_LOT_UNITS"] = "25"
+check("legs disagreeing refuses rather than guessing",
+      _E3.lot_size_for_security(["889285", "889440"]) is None, True)
+_master[2]["SEM_LOT_UNITS"] = "20"
+check("an unknown security id yields nothing",
+      _E3.lot_size_for_security(["000000"]) is None, True)
+
+print("\n[17] Quantity follows the resolved lot size")
+for lot, mult in ((20, 1), (20, 2), (25, 1)):
+    cfg = StrategyConfig(lot_multiplier=mult)
+    e17 = SensexVWAPLadderEngine(cfg)
+    e17.lot_size = lot
+    check(f"lot {lot} x{mult} -> {cfg.lots * lot} qty",
+          cfg.lots * e17.lot_size == cfg.lots * lot, cfg.lots * e17.lot_size)
+print(f"        09-Oct used 75: 3 lots x 75 = 225 qty, should have been "
+      f"3 x 20 = 60 — every P&L was {75 / 20:.2f}x too large")
+
 print("\n" + ("ALL TESTS PASSED" if not FAILS else f"{len(FAILS)} FAILURES: {FAILS}"))
 sys.exit(1 if FAILS else 0)

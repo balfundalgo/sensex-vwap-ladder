@@ -428,31 +428,162 @@ SENSEX = {"security_id": "51", "segment": "BSE_FNO", "idx_segment": "IDX_I",
 MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
 
 
-def fetch_sensex_lot_size() -> Optional[int]:
-    """Lot size is read fresh every session — never hard-coded (spec 2.3)."""
-    log.info("  Fetching SENSEX lot size from scrip master...")
+_MASTER_CACHE = {"rows": None, "at": 0.0}
+LOT_MEMO = BASE_DIR / "last_lot_size.json"
+
+
+def _load_scrip_master(force: bool = False) -> List[dict]:
+    """
+    Download the instrument master once per session and keep it.
+
+    It is a large CSV and we now make several lookups against it, so pulling
+    it repeatedly would add half a minute to start-up for nothing.
+    """
+    if _MASTER_CACHE["rows"] and not force:
+        return _MASTER_CACHE["rows"]
+    import io, csv as csvmod
+    log.info("  Fetching instrument master...")
+    r = SESSION.get(MASTER_URL, stream=True, timeout=120)
+    r.raise_for_status()
+    raw = r.content.decode("utf-8", errors="ignore")
+    if raw.startswith("\ufeff"):
+        raw = raw[1:]
+    rows = list(csvmod.DictReader(io.StringIO(raw)))
+    _MASTER_CACHE["rows"] = rows
+    _MASTER_CACHE["at"] = time.time()
+    log.info(f"  Instrument master loaded ({len(rows):,} rows)")
+    return rows
+
+
+def _row_lot(row: dict) -> int:
     try:
-        import io, csv as csvmod
-        r = SESSION.get(MASTER_URL, stream=True, timeout=120); r.raise_for_status()
-        raw = r.content.decode("utf-8", errors="ignore")
-        if raw.startswith("\ufeff"): raw = raw[1:]
-        for row in csvmod.DictReader(io.StringIO(raw)):
-            if row.get("SEM_INSTRUMENT_NAME", "").strip().upper() != "OPTIDX": continue
-            ts = row.get("SEM_TRADING_SYMBOL", "").upper()
-            if not ts.startswith("SENSEX"): continue
-            try: lot = int(float(row.get("SEM_LOT_UNITS", "0").strip()))
-            except Exception: continue
-            if lot > 0:
-                log.info(f"  SENSEX lot size = {lot}")
-                return lot
+        return int(float(str(row.get("SEM_LOT_UNITS", "0")).strip()))
+    except Exception:
+        return 0
+
+
+def lot_size_for_security(sec_ids: List[str]) -> Optional[int]:
+    """
+    Read the lot size of the exact contracts being traded.
+
+    The old lookup took the FIRST OPTIDX row whose trading symbol started with
+    "SENSEX" and returned its lot units. Two faults: the prefix also matches
+    SENSEX50 and anything else sharing it, and "first row" depends on however
+    Dhan happened to order the CSV that morning.
+
+    It returned 20 for five straight sessions and then 75 on 09-Oct-2026,
+    when the correct value for the 15-Oct expiry was 20. Every P&L that day
+    was 3.75x too large, and in live mode it would have sent 225 quantity
+    where 60 was intended.
+
+    The strike is different every morning, so nothing is cached or assumed —
+    but by the time the lot size is needed we already know the exact security
+    IDs of today's two legs. Match on those. Lot size is a property of the
+    underlying and expiry rather than the strike, so the two legs must agree;
+    if they do not, the lookup is wrong and stopping beats sizing on a guess.
+    """
+    try:
+        rows = _load_scrip_master()
     except Exception as e:
-        log.error(f"  Scrip master error: {e}")
-    return None
+        log.error(f"  Instrument master error: {e}")
+        return None
+
+    by_id = {}
+    for row in rows:
+        sid = str(row.get("SEM_SMST_SECURITY_ID", "")).strip()
+        if sid:
+            by_id[sid] = row
+
+    found = {}
+    for sid in sec_ids:
+        row = by_id.get(str(sid))
+        if not row:
+            log.warning(f"  Security {sid} is not in the instrument master")
+            continue
+        lot = _row_lot(row)
+        if lot > 0:
+            found[str(sid)] = (lot, str(row.get("SEM_TRADING_SYMBOL", "")).strip())
+
+    if not found:
+        return None
+
+    for sid, (lot, sym) in found.items():
+        log.info(f"    {sym or sid}  (secId {sid})  lot = {lot}")
+    lots = {v[0] for v in found.values()}
+    if len(lots) > 1:
+        log.error(f"  The two legs report DIFFERENT lot sizes {sorted(lots)}. "
+                  f"That is impossible for one underlying and expiry, so the "
+                  f"lookup is wrong. Refusing to trade.")
+        return None
+    return lots.pop()
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# TIME HELPERS — session-anchored 2-minute bucketing
-# ═══════════════════════════════════════════════════════════════════════════
+def lot_size_by_expiry(expiry: str, underlying: str = "SENSEX") -> Optional[int]:
+    """
+    Fallback for when a security id is missing from the master, which can
+    happen on a freshly listed contract.
+
+    Takes the MOST COMMON lot size across that underlying's OPTIDX rows for
+    the expiry, so one stray row cannot swing the answer the way "first match"
+    did. SENSEX50 is excluded explicitly — sharing a prefix is what caused
+    the original fault.
+    """
+    try:
+        rows = _load_scrip_master()
+    except Exception as e:
+        log.error(f"  Instrument master error: {e}")
+        return None
+
+    from collections import Counter
+    tally = Counter()
+    for row in rows:
+        if str(row.get("SEM_INSTRUMENT_NAME", "")).strip().upper() != "OPTIDX":
+            continue
+        name = str(row.get("SEM_TRADING_SYMBOL", "") or
+                   row.get("SEM_CUSTOM_SYMBOL", "")).strip().upper()
+        if not name.startswith(underlying):
+            continue
+        tail = name[len(underlying):]
+        if tail[:1].isdigit():
+            continue                      # SENSEX50 and friends
+        exp = str(row.get("SEM_EXPIRY_DATE", "")).strip()[:10]
+        if expiry and exp and exp != expiry:
+            continue
+        lot = _row_lot(row)
+        if lot > 0:
+            tally[lot] += 1
+    if not tally:
+        return None
+    lot, n = tally.most_common(1)[0]
+    if len(tally) > 1:
+        log.warning(f"  Mixed lot sizes for {underlying} {expiry}: "
+                    f"{dict(tally)} — taking the most common ({lot})")
+    log.info(f"  {underlying} {expiry} lot size = {lot} (from {n} contracts)")
+    return lot
+
+
+def _load_last_lot_size() -> Optional[int]:
+    """The previous session's lot size, so a change can be called out."""
+    try:
+        import json as _j
+        return int(_j.loads(LOT_MEMO.read_text()).get("lot_size", 0)) or None
+    except Exception:
+        return None
+
+
+def _save_last_lot_size(lot: int):
+    try:
+        import json as _j
+        LOT_MEMO.write_text(_j.dumps({"lot_size": int(lot),
+                                      "date": now_ist().strftime("%Y-%m-%d")}))
+    except Exception:
+        pass
+
+
+def fetch_sensex_lot_size() -> Optional[int]:
+    """Kept for the offline tools; the engine uses the security-id lookup."""
+    return lot_size_by_expiry(get_nearest_expiry() or "")
+
 
 def now_ist(): return datetime.now(IST)
 
@@ -1081,14 +1212,9 @@ class SensexVWAPLadderEngine:
     def initialize(self) -> bool:
         self._emit("status", {"msg": "Initializing..."})
 
-        lot = fetch_sensex_lot_size()
-        if not lot:
-            self._emit("error", {"msg": "Lot size unavailable — refusing to trade"})
-            log.error("Instrument master unreachable. Halting rather than assuming "
-                      "a stale lot size (spec 2.3).")
-            return False
-        self.lot_size = lot
-
+        # Lot size is resolved further down, after the legs — it is read from
+        # the exact contracts being traded, and those are not known until the
+        # 09:15 open gives us the strike.
         self.expiry = get_nearest_expiry()
         if not self.expiry:
             self._emit("error", {"msg": "No SENSEX expiry found"}); return False
@@ -1101,9 +1227,6 @@ class SensexVWAPLadderEngine:
 
         self.strike = int(round(self.sensex_open / 100.0) * 100)
         log.info(f"  SENSEX 09:15 open = {self.sensex_open:.2f} -> strike {self.strike}")
-        self._emit("strike", {"open": self.sensex_open, "strike": self.strike,
-                              "expiry": self.expiry, "lot_size": self.lot_size})
-
         oc = fetch_option_chain(self.expiry)
         if not oc:
             self._emit("error", {"msg": "Option chain unavailable"}); return False
@@ -1112,9 +1235,57 @@ class SensexVWAPLadderEngine:
         if not self._resolve_legs(oc["oc"]):
             return False
 
+        if not self._resolve_lot_size():
+            return False
+
+        self._emit("strike", {"open": self.sensex_open, "strike": self.strike,
+                              "expiry": self.expiry, "lot_size": self.lot_size})
+
         for name, leg in self.legs.items():
             self._seed_leg(leg)
 
+        return True
+
+    def _resolve_lot_size(self) -> bool:
+        """
+        Read the lot size from the exact contracts about to be traded.
+
+        Runs after the legs because it needs their security IDs. The strike
+        differs every morning, so there is nothing to carry over — both IDs
+        are resolved fresh each session and looked up by exact match.
+        """
+        sec_ids = [l.sec_id for l in self.legs.values() if l.sec_id]
+        if not sec_ids:
+            self._emit("error", {"msg": "No legs resolved — cannot read lot size"})
+            return False
+
+        log.info("  Reading lot size from today's contracts...")
+        lot = lot_size_for_security(sec_ids)
+        source = "security id"
+        if not lot:
+            log.warning("  Falling back to the expiry-wide lookup.")
+            lot = lot_size_by_expiry(self.expiry)
+            source = f"expiry {self.expiry}"
+
+        if not lot or lot <= 0:
+            self._emit("error", {"msg": "Lot size unavailable — refusing to trade"})
+            log.error("  Could not establish the lot size. Halting rather than "
+                      "assuming one (spec 2.3).")
+            return False
+
+        prev = _load_last_lot_size()
+        if prev and prev != lot:
+            log.warning(f"  LOT SIZE CHANGED since the last session: {prev} -> "
+                        f"{lot}. Position value moves by "
+                        f"{(lot / prev - 1) * 100:+.0f}%. Check this against the "
+                        f"exchange circular before trading.")
+            self._emit("lot_size_changed", {"previous": prev, "now": lot})
+
+        self.lot_size = lot
+        _save_last_lot_size(lot)
+        log.info(f"  SENSEX lot size = {lot}  (from {source})")
+        log.info(f"  {self.config.lots} lots x {lot} = "
+                 f"{self.config.lots * lot} quantity per entry")
         return True
 
     def _wait_for_session_open(self, timeout_s: float = 1800.0) -> float:
@@ -2064,6 +2235,9 @@ def _console_monitor():
                      if abs(sc) > 0.005 else "")
             print(f"\n  >> [{d['leg']}] CLOSED {d['reason']} at rung T{d['rung']}"
                   f"  TRADE TOTAL {d['pnl']:+,.0f}{extra}\n")
+        elif event == "lot_size_changed":
+            print(f"\n  >> LOT SIZE CHANGED {d['previous']} -> {d['now']} "
+                  f"— verify against the exchange circular\n")
         elif event == "stale_signal":
             print(f"  >> [{d['leg']}] signal at {d['time']} ignored — bar was "
                   f"{d['age']:.0f}s old")
