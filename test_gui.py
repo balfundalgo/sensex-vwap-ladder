@@ -178,6 +178,16 @@ win._handle("lot_size_changed", {"previous": 20, "now": 25})
 win.update()
 check("change reported", "LOT SIZE CHANGED" in win.trade_log.get("1.0", "end"), True)
 
+print("\n[7h] The daily loss cap is reported")
+win._handle("daily_loss_hit", {"realised": -8921, "unrealised": -1089,
+                               "total": -10010, "limit": 10000, "open_legs": 1})
+win.update()
+lg = win.trade_log.get("1.0", "end")
+check("limit reported", "DAILY LOSS LIMIT" in lg, True)
+check("booked and open shown", "booked" in lg and "open" in lg, True)
+check("status bar changes", "LOSS LIMIT" in win.lbl_status.cget("text"),
+      win.lbl_status.cget("text"))
+
 print("\n[8] Config picks up the study settings")
 win.opt_field.set("hlc3"); win.opt_tf.set("5")
 win.ent_lots.delete(0, "end"); win.ent_lots.insert(0, "2")

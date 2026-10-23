@@ -110,6 +110,37 @@ CLOSED TRAIL_T2  rung=T2  TRADE TOTAL +4,919  = +3,689 scaled + +1,230 final
 Adding every number on screen gives +8,609 for a trade that made +4,919. The
 labels and the breakdown exist so the relationship is visible on the line.
 
+## The daily loss limit is a cap, not a note
+
+The old guard summed **realised** P&L and ran only **after an exit**, so it
+could never stop the trade that breached the limit — only notice afterwards.
+
+22-Oct, limit ₹10,000: the day was **−8,921 realised** when a trade was opened
+risking a further **4,110** against **1,079** of remaining budget. It closed at
+**−11,009**. Had the stop been hit it would have been **−13,031**.
+
+Now the total includes open positions marked to the last traded price, and is
+evaluated **on every tick**. Breaching it closes every open leg immediately and
+halts for the day. Replaying 22-Oct through it, the day ends at **−10,010** —
+the ₹10 being the tick that crossed the line.
+
+```
+  ltp     open P&L   day total   action
+186.15           0      -8,921
+180.00        -369      -9,290
+175.00        -669      -9,590
+171.00        -909      -9,830
+168.00           0     -10,010   HALTED, position closed
+```
+
+Worth being explicit about the cost: this is a **fourth exit reason** the
+strategy spec does not have, and it overrides the stop, the VWAP close and the
+square-off. It will sometimes close a trade that would have recovered. That is
+what a hard cap buys and it was chosen deliberately.
+
+The GUI field now reads **"Stop day at −₹"** rather than "Daily loss ₹", since
+most of the original surprise was the wording rather than the number.
+
 ## Lot size comes from the contracts being traded
 
 The old lookup took the **first** OPTIDX row whose trading symbol **started

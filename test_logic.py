@@ -457,5 +457,64 @@ for lot, mult in ((20, 1), (20, 2), (25, 1)):
 print(f"        09-Oct used 75: 3 lots x 75 = 225 qty, should have been "
       f"3 x 20 = 60 — every P&L was {75 / 20:.2f}x too large")
 
+print("\n[18] REGRESSION 22-Oct: the daily loss limit caps the drawdown")
+# The old guard summed REALISED P&L and ran only after an exit, so it could
+# never stop the trade that breached the limit. The day was -8,921 realised
+# when a trade was opened; it closed at -11,009.
+from engine import Position as _Pos
+
+def loss_engine(realised, limit=10000.0):
+    c = StrategyConfig(paper_mode=True, daily_loss_limit=limit)
+    e = SensexVWAPLadderEngine(c)
+    e.lot_size = 20
+    lg = e.legs["CE"]
+    lg.sec_id = "1"; lg.label = "CE"; lg.strike = 73300
+    e.by_sec["1"] = lg
+    lg.pnl = realised
+    lg.position = _Pos(leg="CE", sec_id="1", strike=73300, trade_id="t",
+                       E=186.15, fill_price=186.15, atr_frozen=24.76,
+                       stop=117.65, initial_stop=117.65, lots_open=3,
+                       lots_at_entry=3, lot_size=20)
+    return e, lg
+
+e18, lg18 = loss_engine(-8921.0)
+e18._on_tick(lg18, 180.00)
+check("inside the limit, nothing happens", not e18._halted, e18._halted)
+check("position still open", lg18.position is not None, True)
+
+e18._on_tick(lg18, 168.00)                 # crosses -10,000
+check("breach halts the engine", e18._halted, True)
+check("the open position was closed", lg18.position is None, True)
+_r, _u, _t = e18.day_pnl()
+check("day lands at about the limit, not past it", abs(_t) < 10100, _t)
+print(f"        closed at Rs.{_t:+,.0f}; 22-Oct actually closed at -11,009")
+
+print("\n[19] The cap counts unrealised, which is the whole point")
+e19, lg19 = loss_engine(-5000.0)
+e19._on_tick(lg19, 186.15)
+r, u, t = e19.day_pnl()
+check("flat position contributes nothing", abs(u) < 1e-9, u)
+e19._on_tick(lg19, 100.00)                 # deep underwater, realised untouched
+check("unrealised alone can breach", e19._halted, True)
+check("and the position is closed", lg19.position is None, True)
+
+print("\n[20] The limit off means the limit off")
+e20, lg20 = loss_engine(-50000.0, limit=0.0)
+e20._on_tick(lg20, 150.00)          # above the stop, so only the cap could act
+check("no limit set, no halt", not e20._halted, e20._halted)
+check("position left alone", lg20.position is not None, True)
+
+# and with the cap on, the same tick DOES act — proving the guard is the cause
+e20b, lg20b = loss_engine(-50000.0, limit=10000.0)
+e20b._on_tick(lg20b, 150.00)
+check("same tick with the cap on halts", e20b._halted, True)
+
+print("\n[21] A profitable open position does not trip it")
+e21, lg21 = loss_engine(-9500.0)
+e21._on_tick(lg21, 220.00)                 # open profit offsets the booked loss
+r, u, t = e21.day_pnl()
+check("total is inside the limit", t > -10000, t)
+check("no halt while the book is above the line", not e21._halted, e21._halted)
+
 print("\n" + ("ALL TESTS PASSED" if not FAILS else f"{len(FAILS)} FAILURES: {FAILS}"))
 sys.exit(1 if FAILS else 0)

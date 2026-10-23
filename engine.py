@@ -1197,6 +1197,7 @@ class SensexVWAPLadderEngine:
         self.closed: List[dict] = []
         self.packet_count = 0
         self.last_tick_at = 0.0
+        self._loss_halting = False
         self._quote_debug = 0
         self._halted = False
         self._trade_seq = 0
@@ -1688,6 +1689,12 @@ class SensexVWAPLadderEngine:
 
     def _on_tick(self, leg: Leg, ltp: float):
         leg.ltp = ltp
+        # Mark the book on every tick so the daily limit caps the drawdown
+        # instead of reporting it afterwards.
+        if self.config.daily_loss_limit > 0 and not self._halted:
+            self._check_daily_loss()
+            if self._halted:
+                return
         if leg.state == LegState.ARMED:
             if not self._fill_window_open():
                 log.info(f"  [{leg.label}] Past {self.config.last_entry} — resting "
@@ -1873,13 +1880,64 @@ class SensexVWAPLadderEngine:
             hold_seconds=int(time.time() - pos.opened_at),
             entry_order_id=pos.entry_order_id, exit_order_id=oid)
 
+    def day_pnl(self) -> tuple:
+        """(realised, unrealised, total) across both legs, marked to the last tick."""
+        realised = unreal = 0.0
+        for leg in self.legs.values():
+            realised += leg.pnl
+            pos = leg.position
+            if pos and leg.ltp and pos.lots_open:
+                unreal += (leg.ltp - pos.E) * pos.lots_open * pos.lot_size
+        return realised, unreal, realised + unreal
+
     def _check_daily_loss(self):
+        """
+        Close everything the moment the day's loss reaches the limit.
+
+        The old version summed REALISED P&L only, and ran only after an exit,
+        so it could never stop the trade that breached the limit — only notice
+        afterwards. On 22-Oct the day was -8,921 realised when a trade was
+        opened risking a further 4,110 against 1,079 of remaining budget. It
+        closed at -11,009; had the stop been hit it would have been -13,031.
+
+        Now the total includes open positions marked to the last traded price
+        and is evaluated on every tick, so the limit is a cap on the drawdown
+        rather than a note made after the fact. Breaching it exits every open
+        leg immediately and halts.
+
+        This is a fourth exit reason the strategy spec does not have — it
+        overrides the stop, the VWAP close and the square-off — and it will
+        sometimes close a trade that would have recovered. That is what a hard
+        cap costs, and it was chosen deliberately.
+        """
         lim = self.config.daily_loss_limit
-        if lim <= 0: return
-        total = sum(l.pnl for l in self.legs.values())
-        if total <= -abs(lim):
-            log.error(f"  DAILY LOSS LIMIT hit (Rs.{total:+,.0f}) — halting.")
-            self._halt("DAILY_LOSS")
+        if lim <= 0 or self._halted or self._loss_halting:
+            return
+        realised, unreal, total = self.day_pnl()
+        if total > -abs(lim):
+            return
+
+        self._loss_halting = True
+        try:
+            open_legs = [l for l in self.legs.values()
+                         if l.position and l.position.lots_open]
+            log.error(f"  DAILY LOSS LIMIT hit: Rs.{total:+,.0f} "
+                      f"(booked Rs.{realised:+,.0f}, open Rs.{unreal:+,.0f}) "
+                      f"against a limit of Rs.{abs(lim):,.0f}.")
+            if open_legs:
+                log.error(f"  Closing {len(open_legs)} open position(s) now.")
+            self._emit("daily_loss_hit", {"realised": realised,
+                                          "unrealised": unreal, "total": total,
+                                          "limit": abs(lim),
+                                          "open_legs": len(open_legs)})
+            for leg in open_legs:
+                price = leg.ltp or leg.position.E
+                self._exit_all(leg, price, "DAILY_LOSS")
+            r2, u2, t2 = self.day_pnl()
+            log.error(f"  Day closed at Rs.{t2:+,.0f}. No further trades today.")
+        finally:
+            self._loss_halting = False
+        self._halt("DAILY_LOSS")
 
     def _halt(self, reason: str):
         self._halted = True
@@ -2235,6 +2293,11 @@ def _console_monitor():
                      if abs(sc) > 0.005 else "")
             print(f"\n  >> [{d['leg']}] CLOSED {d['reason']} at rung T{d['rung']}"
                   f"  TRADE TOTAL {d['pnl']:+,.0f}{extra}\n")
+        elif event == "daily_loss_hit":
+            print(f"\n  >> DAILY LOSS LIMIT {d['limit']:,.0f} reached — day at "
+                  f"{d['total']:+,.0f} (booked {d['realised']:+,.0f}, open "
+                  f"{d['unrealised']:+,.0f}). Closing {d['open_legs']} "
+                  f"position(s) and stopping.\n")
         elif event == "lot_size_changed":
             print(f"\n  >> LOT SIZE CHANGED {d['previous']} -> {d['now']} "
                   f"— verify against the exchange circular\n")

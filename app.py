@@ -185,8 +185,10 @@ class SensexApp(ctk.CTk):
         self._sec(p, "🛡 GUARDS  (0 = off)")
         g = ctk.CTkFrame(p, fg_color="transparent"); g.pack(fill="x", padx=14, pady=2)
         self.ent_minp = self._gentry(g, "Min premium ₹", "0", 0)
-        self.ent_dll = self._gentry(g, "Daily loss ₹", "0", 1)
-        ctk.CTkLabel(p, text="Both are open items — off until the client decides.",
+        self.ent_dll = self._gentry(g, "Stop day at −₹", "0", 1)
+        ctk.CTkLabel(p, text="Stop day at: counts booked AND open P&L on every "
+                             "tick. On breach it closes any open position "
+                             "immediately and stops trading for the day.",
                      font=FT2, text_color=DIM, wraplength=250, justify="left"
                      ).pack(anchor="w", padx=14, pady=(2, 0))
 
@@ -484,6 +486,13 @@ class SensexApp(ctk.CTk):
                       if abs(scaled) > 0.005 else "")
             self._log(f"{icon} [{d.get('leg')}] CLOSED {d.get('reason')} "
                       f"rung=T{d.get('rung',0)}  TRADE TOTAL ₹{pnl:+,.0f}{detail}")
+        elif ev == "daily_loss_hit":
+            self._log(f"🛑 DAILY LOSS LIMIT ₹{d.get('limit',0):,.0f} reached — "
+                      f"day at ₹{d.get('total',0):+,.0f} "
+                      f"(booked ₹{d.get('realised',0):+,.0f}, "
+                      f"open ₹{d.get('unrealised',0):+,.0f}). "
+                      f"Closing {d.get('open_legs',0)} position(s) and stopping.")
+            self.lbl_status.configure(text="● LOSS LIMIT", text_color=RED)
         elif ev == "lot_size_changed":
             self._log(f"⚠ LOT SIZE CHANGED {d.get('previous')} → {d.get('now')}. "
                       f"Position value moves accordingly — verify against the "
