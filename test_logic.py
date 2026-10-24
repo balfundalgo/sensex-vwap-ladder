@@ -477,6 +477,38 @@ check("a second prefetch does not re-download",
       (_E3.prefetch_scrip_master(), _E3._MASTER["ready"].is_set())[1], True)
 _E3.SESSION = _saved_session
 
+print("\n[16c] The lot-size memo round-trips (it was silently dead)")
+# LOT_MEMO's definition was deleted by an unrelated edit. Both accessors wrap
+# everything in `except Exception`, so a NameError looked exactly like a
+# missing file: the change warning was dead for a whole build and nothing
+# failed. The handlers are now narrow, and this test exercises the path.
+_E3.LOT_MEMO.unlink(missing_ok=True)
+check("no memo yet reads as None", _E3._load_last_lot_size() is None, True)
+_E3._save_last_lot_size(20)
+check("a saved value reads back", _E3._load_last_lot_size() == 20,
+      _E3._load_last_lot_size())
+_E3._save_last_lot_size(25)
+check("and is overwritten", _E3._load_last_lot_size() == 25,
+      _E3._load_last_lot_size())
+check("LOT_MEMO is actually defined", hasattr(_E3, "LOT_MEMO"), True)
+
+# the warning that depends on it
+_E3._save_last_lot_size(20)
+_E3._MASTER["by_id"]["889285"] = (25, "SENSEX-CE", "2026-10-15")
+_E3._MASTER["by_id"]["889440"] = (25, "SENSEX-PE", "2026-10-15")
+_e16 = SensexVWAPLadderEngine(StrategyConfig())
+_e16.expiry = "2026-10-15"
+_e16.legs["CE"].sec_id = "889285"
+_e16.legs["PE"].sec_id = "889440"
+_evts = []
+_e16.gui_cb = lambda ev, d: _evts.append(ev)
+_e16._resolve_lot_size()
+check("a lot-size change is announced", "lot_size_changed" in _evts, _evts)
+check("and the new size is adopted", _e16.lot_size == 25, _e16.lot_size)
+_E3.LOT_MEMO.unlink(missing_ok=True)
+_E3._MASTER["by_id"]["889285"] = (20, "SENSEX-Oct2026-71800-CE", "2026-10-15")
+_E3._MASTER["by_id"]["889440"] = (20, "SENSEX-Oct2026-71800-PE", "2026-10-15")
+
 print("\n[17] Quantity follows the resolved lot size")
 for lot, mult in ((20, 1), (20, 2), (25, 1)):
     cfg = StrategyConfig(lot_multiplier=mult)

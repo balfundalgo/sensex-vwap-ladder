@@ -448,6 +448,8 @@ MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
 # So: start the download in the background the moment the engine starts, and
 # index only what is actually needed while the bytes arrive.
 
+LOT_MEMO = BASE_DIR / "last_lot_size.json"
+
 _MASTER = {
     "by_id": {},        # security id -> (lot, symbol, expiry)
     "by_expiry": [],    # (symbol, expiry, lot) for the fallback tally
@@ -649,11 +651,21 @@ def lot_size_by_expiry(expiry: str, underlying: str = "SENSEX") -> Optional[int]
 
 
 def _load_last_lot_size() -> Optional[int]:
-    """The previous session's lot size, so a change can be called out."""
+    """
+    The previous session's lot size, so a change can be called out.
+
+    The exception handling is deliberately narrow. A broad `except Exception`
+    here once hid a NameError — LOT_MEMO had been deleted by an unrelated edit
+    and the lot-size-change warning was silently dead for a build, because a
+    missing file and a missing variable looked identical.
+    """
     try:
         import json as _j
         return int(_j.loads(LOT_MEMO.read_text()).get("lot_size", 0)) or None
-    except Exception:
+    except (FileNotFoundError, ValueError, KeyError, TypeError):
+        return None
+    except Exception as e:
+        log.warning(f"  Could not read the lot-size memo: {type(e).__name__}: {e}")
         return None
 
 
@@ -662,8 +674,10 @@ def _save_last_lot_size(lot: int):
         import json as _j
         LOT_MEMO.write_text(_j.dumps({"lot_size": int(lot),
                                       "date": now_ist().strftime("%Y-%m-%d")}))
-    except Exception:
-        pass
+    except OSError as e:
+        log.warning(f"  Could not write the lot-size memo: {e}")
+    except Exception as e:
+        log.warning(f"  Lot-size memo error: {type(e).__name__}: {e}")
 
 
 def fetch_sensex_lot_size() -> Optional[int]:
