@@ -400,26 +400,21 @@ for tf in (1, 2, 5, 15):
 
 print("\n[16] REGRESSION 09-Oct: lot size comes from the traded contracts")
 import engine as _E3
-_master = [
- {"SEM_INSTRUMENT_NAME": "OPTIDX", "SEM_TRADING_SYMBOL": "SENSEX50 15 OCT 71800 CE",
-  "SEM_SMST_SECURITY_ID": "111111", "SEM_LOT_UNITS": "75",
-  "SEM_EXPIRY_DATE": "2026-10-15"},
- {"SEM_INSTRUMENT_NAME": "OPTIDX", "SEM_TRADING_SYMBOL": "SENSEX 15 OCT 71800 CE",
-  "SEM_SMST_SECURITY_ID": "889285", "SEM_LOT_UNITS": "20",
-  "SEM_EXPIRY_DATE": "2026-10-15"},
- {"SEM_INSTRUMENT_NAME": "OPTIDX", "SEM_TRADING_SYMBOL": "SENSEX 15 OCT 71800 PE",
-  "SEM_SMST_SECURITY_ID": "889440", "SEM_LOT_UNITS": "20",
-  "SEM_EXPIRY_DATE": "2026-10-15"},
- {"SEM_INSTRUMENT_NAME": "OPTIDX", "SEM_TRADING_SYMBOL": "SENSEX 22 OCT 72000 CE",
-  "SEM_SMST_SECURITY_ID": "900001", "SEM_LOT_UNITS": "20",
-  "SEM_EXPIRY_DATE": "2026-10-22"},
+_E3._MASTER["by_id"] = {
+    "111111":  (75, "SENSEX50-Oct2026-74300-CE", "2026-10-15"),
+    "889285":  (20, "SENSEX-Oct2026-71800-CE",   "2026-10-15"),
+    "889440":  (20, "SENSEX-Oct2026-71800-PE",   "2026-10-15"),
+    "900001":  (20, "SENSEX-Oct2026-72000-CE",   "2026-10-22"),
+}
+_E3._MASTER["by_expiry"] = [
+    ("SENSEX50-OCT2026-74300-CE", "2026-10-15", 75),
+    ("SENSEX-OCT2026-71800-CE",   "2026-10-15", 20),
+    ("SENSEX-OCT2026-71800-PE",   "2026-10-15", 20),
+    ("SENSEX-OCT2026-72000-CE",   "2026-10-22", 20),
 ]
-_E3._MASTER_CACHE["rows"] = _master
-
-# the old rule, restated so the test fails if anyone reinstates it
-_old = next(r["SEM_LOT_UNITS"] for r in _master
-            if r["SEM_TRADING_SYMBOL"].upper().startswith("SENSEX"))
-check("the old prefix rule really did pick 75", _old == "75", _old)
+_E3._MASTER["started"] = True
+_E3._MASTER["error"] = None
+_E3._MASTER["ready"].set()
 
 check("exact security-id lookup gives 20",
       _E3.lot_size_for_security(["889285", "889440"]) == 20,
@@ -432,20 +427,55 @@ check("a different expiry resolves on its own rows",
       _E3.lot_size_by_expiry("2026-10-22"))
 
 # tomorrow: different strike, different ids
-_master.append({"SEM_INSTRUMENT_NAME": "OPTIDX",
-                "SEM_TRADING_SYMBOL": "SENSEX 15 OCT 72500 PE",
-                "SEM_SMST_SECURITY_ID": "889999", "SEM_LOT_UNITS": "20",
-                "SEM_EXPIRY_DATE": "2026-10-15"})
+_E3._MASTER["by_id"]["889999"] = (20, "SENSEX-Oct2026-72500-PE", "2026-10-15")
 check("a different strike tomorrow resolves the same way",
       _E3.lot_size_for_security(["889999"]) == 20,
       _E3.lot_size_for_security(["889999"]))
 
-_master[2]["SEM_LOT_UNITS"] = "25"
+_E3._MASTER["by_id"]["889440"] = (25, "SENSEX-Oct2026-71800-PE", "2026-10-15")
 check("legs disagreeing refuses rather than guessing",
       _E3.lot_size_for_security(["889285", "889440"]) is None, True)
-_master[2]["SEM_LOT_UNITS"] = "20"
-check("an unknown security id yields nothing",
-      _E3.lot_size_for_security(["000000"]) is None, True)
+_E3._MASTER["by_id"]["889440"] = (20, "SENSEX-Oct2026-71800-PE", "2026-10-15")
+
+print("\n[16b] REGRESSION 21-Oct: the master is indexed, not materialised")
+import io as _io, csv as _csv
+_hdr = ("SEM_SMST_SECURITY_ID,SEM_TRADING_SYMBOL,SEM_INSTRUMENT_NAME,"
+        "SEM_LOT_UNITS,SEM_EXPIRY_DATE")
+_lines = [_hdr,
+          "111111,SENSEX50-Oct2026-74300-CE,OPTIDX,75,2026-10-22",
+          "1125634,SENSEX-Oct2026-74300-CE,OPTIDX,20,2026-10-22",
+          "1124548,SENSEX-Oct2026-74300-PE,OPTIDX,20,2026-10-22",
+          "5,RELIANCE,EQUITY,1,",
+          "6,NIFTY-Oct2026-24000-CE,OPTIDX,65,2026-10-22"]
+
+
+class _Resp:
+    def raise_for_status(self): pass
+    def iter_lines(self):
+        for ln in _lines:
+            yield ln.encode()
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+
+
+_saved_session = _E3.SESSION
+_E3.SESSION = type("S", (), {"get": staticmethod(lambda *a, **k: _Resp())})()
+_E3._MASTER["started"] = False
+_E3._MASTER["ready"].clear()
+_E3._MASTER["by_id"] = {}
+_E3._MASTER["by_expiry"] = []
+_E3.prefetch_scrip_master()
+check("prefetch completes", _E3._MASTER["ready"].wait(10), True)
+check("only option contracts are held",
+      "5" not in _E3._MASTER["by_id"], True)
+check("other underlyings are not held",
+      "6" not in _E3._MASTER["by_id"], True)
+check("our legs are indexed",
+      _E3.lot_size_for_security(["1125634", "1124548"]) == 20,
+      _E3.lot_size_for_security(["1125634", "1124548"]))
+check("a second prefetch does not re-download",
+      (_E3.prefetch_scrip_master(), _E3._MASTER["ready"].is_set())[1], True)
+_E3.SESSION = _saved_session
 
 print("\n[17] Quantity follows the resolved lot size")
 for lot, mult in ((20, 1), (20, 2), (25, 1)):

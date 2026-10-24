@@ -428,87 +428,183 @@ SENSEX = {"security_id": "51", "segment": "BSE_FNO", "idx_segment": "IDX_I",
 MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
 
 
-_MASTER_CACHE = {"rows": None, "at": 0.0}
-LOT_MEMO = BASE_DIR / "last_lot_size.json"
+# ═══════════════════════════════════════════════════════════════════════════
+# INSTRUMENT MASTER
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# 21-Oct: the master was fetched at 09:15:01 and finished at 09:19:09. The
+# strategy was blind for the first four minutes of the session.
+#
+# Two separate mistakes, both introduced with the security-id lot-size fix:
+#
+#   TIMING  lot size now resolves after the legs, so the fetch moved from the
+#           pre-open wait (where four minutes costs nothing) to just after the
+#           open (where it costs everything). The master does not depend on
+#           the strike, so there was never a reason for it to wait.
+#
+#   COST    the previous code streamed the CSV and stopped at the first match.
+#           Mine downloaded all 19 MB and built 211,969 dictionaries first.
+#
+# So: start the download in the background the moment the engine starts, and
+# index only what is actually needed while the bytes arrive.
+
+_MASTER = {
+    "by_id": {},        # security id -> (lot, symbol, expiry)
+    "by_expiry": [],    # (symbol, expiry, lot) for the fallback tally
+    "ready": threading.Event(),
+    "started": False,
+    "error": None,
+    "rows": 0,
+    "seconds": 0.0,
+}
+_MASTER_LOCK = threading.Lock()
+MASTER_UNDERLYINGS = ("SENSEX", "BANKEX")
 
 
-def _load_scrip_master(force: bool = False) -> List[dict]:
-    """
-    Download the instrument master once per session and keep it.
+def _index_master_stream(resp) -> None:
+    """Build the lookup while the bytes arrive, holding only what we need."""
+    import csv as csvmod
+    lines = (ln.decode("utf-8", errors="ignore")
+             for ln in resp.iter_lines() if ln)
+    reader = csvmod.reader(lines)
+    header = next(reader)
+    header = [h.lstrip("\ufeff").strip() for h in header]
+    ix = {name: i for i, name in enumerate(header)}
+    need = ("SEM_SMST_SECURITY_ID", "SEM_TRADING_SYMBOL",
+            "SEM_INSTRUMENT_NAME", "SEM_LOT_UNITS", "SEM_EXPIRY_DATE")
+    missing = [c for c in need if c not in ix]
+    if missing:
+        raise ValueError(f"instrument master is missing columns: {missing}")
+    ID, SYM, INS, LOT, EXP = (ix[c] for c in need)
 
-    It is a large CSV and we now make several lookups against it, so pulling
-    it repeatedly would add half a minute to start-up for nothing.
-    """
-    if _MASTER_CACHE["rows"] and not force:
-        return _MASTER_CACHE["rows"]
-    import io, csv as csvmod
-    log.info("  Fetching instrument master...")
-    r = SESSION.get(MASTER_URL, stream=True, timeout=120)
-    r.raise_for_status()
-    raw = r.content.decode("utf-8", errors="ignore")
-    if raw.startswith("\ufeff"):
-        raw = raw[1:]
-    rows = list(csvmod.DictReader(io.StringIO(raw)))
-    _MASTER_CACHE["rows"] = rows
-    _MASTER_CACHE["at"] = time.time()
-    log.info(f"  Instrument master loaded ({len(rows):,} rows)")
-    return rows
+    by_id, by_exp, n = {}, [], 0
+    for row in reader:
+        n += 1
+        if len(row) <= EXP or row[INS] != "OPTIDX":
+            continue
+        sym = row[SYM].strip().upper()
+        if not sym.startswith(MASTER_UNDERLYINGS):
+            continue
+        try:
+            lot = int(float(row[LOT]))
+        except (ValueError, TypeError):
+            continue
+        if lot <= 0:
+            continue
+        exp = row[EXP].strip()[:10]
+        by_id[row[ID].strip()] = (lot, row[SYM].strip(), exp)
+        by_exp.append((sym, exp, lot))
+
+    _MASTER["by_id"] = by_id
+    _MASTER["by_expiry"] = by_exp
+    _MASTER["rows"] = n
 
 
-def _row_lot(row: dict) -> int:
+def _fetch_master_now():
+    t0 = time.time()
     try:
-        return int(float(str(row.get("SEM_LOT_UNITS", "0")).strip()))
-    except Exception:
-        return 0
+        with SESSION.get(MASTER_URL, stream=True, timeout=180) as r:
+            r.raise_for_status()
+            _index_master_stream(r)
+        _MASTER["error"] = None
+        _MASTER["seconds"] = time.time() - t0
+        log.info(f"  Instrument master indexed: {len(_MASTER['by_id']):,} "
+                 f"contracts from {_MASTER['rows']:,} rows "
+                 f"in {_MASTER['seconds']:.0f}s")
+    except Exception as e:
+        _MASTER["error"] = str(e)
+        log.error(f"  Instrument master failed after "
+                  f"{time.time() - t0:.0f}s: {e}")
+    finally:
+        _MASTER["ready"].set()
+
+
+def prefetch_scrip_master():
+    """
+    Start downloading the master in the background, now.
+
+    Called at start-up, long before the strike is known, so the cost lands in
+    the pre-open wait instead of the first minutes of the session.
+    """
+    with _MASTER_LOCK:
+        if _MASTER["started"]:
+            return
+        _MASTER["started"] = True
+    log.info("  Fetching instrument master in the background...")
+    threading.Thread(target=_fetch_master_now, daemon=True,
+                     name="scrip-master").start()
+
+
+def _ensure_master(timeout: float = 240.0) -> bool:
+    """Block until the master is indexed. Starts it if nobody has."""
+    if not _MASTER["started"]:
+        prefetch_scrip_master()
+    if not _MASTER["ready"].is_set():
+        log.info("  Waiting for the instrument master to finish...")
+    if not _MASTER["ready"].wait(timeout):
+        log.error(f"  Instrument master did not arrive within {timeout:.0f}s")
+        return False
+    if _MASTER["error"]:
+        return False
+    return bool(_MASTER["by_id"])
+
+
+def _refresh_master():
+    """Force a re-download; only used if a security id is missing."""
+    with _MASTER_LOCK:
+        _MASTER["started"] = True
+        _MASTER["ready"].clear()
+    _fetch_master_now()
 
 
 def lot_size_for_security(sec_ids: List[str]) -> Optional[int]:
     """
     Read the lot size of the exact contracts being traded.
 
-    The old lookup took the FIRST OPTIDX row whose trading symbol started with
-    "SENSEX" and returned its lot units. Two faults: the prefix also matches
-    SENSEX50 and anything else sharing it, and "first row" depends on however
-    Dhan happened to order the CSV that morning.
+    The original lookup took the FIRST OPTIDX row whose symbol STARTED WITH
+    "SENSEX". That also matches SENSEX50, and "first row" depends on however
+    Dhan ordered the CSV that morning. It gave 20 for five sessions and then
+    75 on 09-Oct-2026, where 20 was correct — every P&L that day was 3.75x
+    too large, and live it would have sent 225 quantity instead of 60.
 
-    It returned 20 for five straight sessions and then 75 on 09-Oct-2026,
-    when the correct value for the 15-Oct expiry was 20. Every P&L that day
-    was 3.75x too large, and in live mode it would have sent 225 quantity
-    where 60 was intended.
-
-    The strike is different every morning, so nothing is cached or assumed —
-    but by the time the lot size is needed we already know the exact security
-    IDs of today's two legs. Match on those. Lot size is a property of the
-    underlying and expiry rather than the strike, so the two legs must agree;
-    if they do not, the lookup is wrong and stopping beats sizing on a guess.
+    The strike differs every morning, so nothing is cached across sessions.
+    By the time this runs the option chain has already given us the exact
+    security IDs of today's legs, so they are matched exactly. Lot size is a
+    property of the underlying and expiry rather than the strike, so the legs
+    must agree; if they do not, the lookup is wrong and stopping beats sizing
+    on a guess.
     """
-    try:
-        rows = _load_scrip_master()
-    except Exception as e:
-        log.error(f"  Instrument master error: {e}")
+    if not _ensure_master():
         return None
 
-    by_id = {}
-    for row in rows:
-        sid = str(row.get("SEM_SMST_SECURITY_ID", "")).strip()
-        if sid:
-            by_id[sid] = row
-
     found = {}
+    missing = []
     for sid in sec_ids:
-        row = by_id.get(str(sid))
-        if not row:
-            log.warning(f"  Security {sid} is not in the instrument master")
+        hit = _MASTER["by_id"].get(str(sid))
+        if not hit:
+            missing.append(str(sid))
             continue
-        lot = _row_lot(row)
-        if lot > 0:
-            found[str(sid)] = (lot, str(row.get("SEM_TRADING_SYMBOL", "")).strip())
+        found[str(sid)] = hit
+
+    if missing and not found:
+        # A contract listed after our copy was taken. Worth one retry.
+        log.warning(f"  {len(missing)} security id(s) absent — refreshing the "
+                    f"instrument master once.")
+        _refresh_master()
+        for sid in missing:
+            hit = _MASTER["by_id"].get(str(sid))
+            if hit:
+                found[str(sid)] = hit
+
+    for sid in sec_ids:
+        if str(sid) not in found:
+            log.warning(f"  Security {sid} is not in the instrument master")
 
     if not found:
         return None
 
-    for sid, (lot, sym) in found.items():
-        log.info(f"    {sym or sid}  (secId {sid})  lot = {lot}")
+    for sid, (lot, sym, exp) in found.items():
+        log.info(f"    {sym or sid}  (secId {sid})  expiry {exp}  lot = {lot}")
     lots = {v[0] for v in found.values()}
     if len(lots) > 1:
         log.error(f"  The two legs report DIFFERENT lot sizes {sorted(lots)}. "
@@ -520,38 +616,28 @@ def lot_size_for_security(sec_ids: List[str]) -> Optional[int]:
 
 def lot_size_by_expiry(expiry: str, underlying: str = "SENSEX") -> Optional[int]:
     """
-    Fallback for when a security id is missing from the master, which can
-    happen on a freshly listed contract.
+    Fallback for when a security id is missing, which can happen on a freshly
+    listed contract.
 
-    Takes the MOST COMMON lot size across that underlying's OPTIDX rows for
-    the expiry, so one stray row cannot swing the answer the way "first match"
-    did. SENSEX50 is excluded explicitly — sharing a prefix is what caused
-    the original fault.
+    Takes the MOST COMMON lot size across that underlying and expiry, so one
+    stray row cannot swing the answer the way "first match" did. SENSEX50 is
+    excluded explicitly — sharing a prefix is what caused the original fault.
     """
-    try:
-        rows = _load_scrip_master()
-    except Exception as e:
-        log.error(f"  Instrument master error: {e}")
+    if not _ensure_master():
         return None
 
     from collections import Counter
     tally = Counter()
-    for row in rows:
-        if str(row.get("SEM_INSTRUMENT_NAME", "")).strip().upper() != "OPTIDX":
+    want = underlying.upper()
+    for sym, exp, lot in _MASTER["by_expiry"]:
+        if not sym.startswith(want):
             continue
-        name = str(row.get("SEM_TRADING_SYMBOL", "") or
-                   row.get("SEM_CUSTOM_SYMBOL", "")).strip().upper()
-        if not name.startswith(underlying):
-            continue
-        tail = name[len(underlying):]
+        tail = sym[len(want):]
         if tail[:1].isdigit():
             continue                      # SENSEX50 and friends
-        exp = str(row.get("SEM_EXPIRY_DATE", "")).strip()[:10]
         if expiry and exp and exp != expiry:
             continue
-        lot = _row_lot(row)
-        if lot > 0:
-            tally[lot] += 1
+        tally[lot] += 1
     if not tally:
         return None
     lot, n = tally.most_common(1)[0]
@@ -1213,9 +1299,13 @@ class SensexVWAPLadderEngine:
     def initialize(self) -> bool:
         self._emit("status", {"msg": "Initializing..."})
 
-        # Lot size is resolved further down, after the legs — it is read from
-        # the exact contracts being traded, and those are not known until the
-        # 09:15 open gives us the strike.
+        # Start the instrument master downloading NOW, in the background. The
+        # lot size is not needed until after the 09:15 open, but the download
+        # has nothing to do with the strike — so it belongs in the pre-open
+        # wait, not in the first minutes of the session. On 21-Oct it ran at
+        # 09:15:01 and finished at 09:19:09, four minutes of blindness.
+        prefetch_scrip_master()
+
         self.expiry = get_nearest_expiry()
         if not self.expiry:
             self._emit("error", {"msg": "No SENSEX expiry found"}); return False
@@ -1260,6 +1350,10 @@ class SensexVWAPLadderEngine:
             self._emit("error", {"msg": "No legs resolved — cannot read lot size"})
             return False
 
+        if not _MASTER["ready"].is_set():
+            log.warning("  The instrument master is still downloading — the "
+                        "feed start will wait for it. It should have finished "
+                        "before the open.")
         log.info("  Reading lot size from today's contracts...")
         lot = lot_size_for_security(sec_ids)
         source = "security id"
@@ -1284,7 +1378,8 @@ class SensexVWAPLadderEngine:
 
         self.lot_size = lot
         _save_last_lot_size(lot)
-        log.info(f"  SENSEX lot size = {lot}  (from {source})")
+        log.info(f"  SENSEX lot size = {lot}  (from {source}; master took "
+                 f"{_MASTER['seconds']:.0f}s, fetched pre-open)")
         log.info(f"  {self.config.lots} lots x {lot} = "
                  f"{self.config.lots * lot} quantity per entry")
         return True

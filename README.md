@@ -141,6 +141,38 @@ what a hard cap buys and it was chosen deliberately.
 The GUI field now reads **"Stop day at −₹"** rather than "Daily loss ₹", since
 most of the original surprise was the wording rather than the number.
 
+## The instrument master downloads before the open, not after it
+
+21-Oct: the master was fetched at 09:15:01 and finished at 09:19:09. The
+strategy was blind for the first four minutes of the session.
+
+Two mistakes, both introduced alongside the security-id lot-size fix:
+
+* **Timing.** Lot size now resolves after the legs, so the fetch moved from
+  the pre-open wait — where four minutes costs nothing — to just after the
+  open, where it costs everything. The download has nothing to do with the
+  strike, so there was never a reason for it to wait.
+* **Cost.** The previous code streamed the CSV and stopped at the first match.
+  The replacement downloaded all 19 MB and built 211,969 dictionaries before
+  looking at any of them.
+
+`prefetch_scrip_master()` now starts the download in a background thread the
+moment the engine starts, and indexes rows as the bytes arrive — keeping only
+option contracts for the underlyings we trade, as `(lot, symbol, expiry)`
+tuples rather than dictionaries. By 09:15 the answer is already in memory:
+
+```
+08:58:34  Fetching instrument master in the background...
+09:01:02  Instrument master indexed: 9,184 contracts from 211,969 rows in 148s
+09:15:01  SENSEX 09:15 open = 74337.93 -> strike 74300
+09:15:01  SENSEX-Oct2026-74300-CE (secId 1125634) expiry 2026-10-22 lot = 20
+09:15:01  SENSEX lot size = 20  (from security id; master took 148s, pre-open)
+09:15:02  REST candle feed started
+```
+
+If it somehow has not finished by 09:15 the engine says so and waits, rather
+than starting a second download.
+
 ## Lot size comes from the contracts being traded
 
 The old lookup took the **first** OPTIDX row whose trading symbol **started
