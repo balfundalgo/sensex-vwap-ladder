@@ -1,0 +1,2813 @@
+#!/usr/bin/env python3
+"""
+SENSEX VWAP Reclaim + ATR Ladder — Strategy Engine v1.0
+════════════════════════════════════════════════════════
+Spec: "The Line and the Ladder" v1.1 (BF-SNX-VWAP-ATR)
+
+One strike (SENSEX open rounded to nearest 100), both legs (CE + PE),
+each traded independently on 2-minute candles.
+
+  Entry   : candle closes above its own session VWAP (OHLC4)
+            -> buy stop at that candle's high + 0.20, valid ONE candle
+  Stop    : signal candle low - 1.00
+  Ladder  : Tn = E + 2*ATR*n   (ATR frozen at signal candle)
+            T1 -> sell 1 lot, stop to E+2 | T2 -> sell 1 lot, stop to T1
+            T3+ -> stop trails one rung behind, no ceiling
+  Exit    : stop hit | candle closes below VWAP | 15:00 square-off
+  Repeat  : ONE attempt per trip above VWAP. Only a close BELOW VWAP resets.
+
+Balfund Trading Pvt Ltd | www.balfund.com
+"""
+
+import os, sys, time, json, csv, struct, threading, logging
+from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass, field
+from typing import Dict, Optional, List, Any
+from enum import Enum
+from pathlib import Path
+
+import socket
+import requests
+import pyotp
+import websocket
+from dotenv import load_dotenv, set_key
+
+# Indicators live in their own module so that the live engine, the replay path
+# and reconcile.py are guaranteed to compute identically. See indicators.py for
+# the ChartIQ definitions these implement.
+from indicators import (SessionVWAP, WilderATR, price_field, true_range,
+                        aggregate, AGG_MODES)
+from restfeed import RestCandleFeed
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PATHS
+# ═══════════════════════════════════════════════════════════════════════════
+
+if getattr(sys, 'frozen', False):
+    BASE_DIR = Path(sys.executable).parent
+else:
+    BASE_DIR = Path(__file__).parent if "__file__" in globals() else Path.cwd()
+
+ENV_FILE = BASE_DIR / ".env"
+STATE_FILE = BASE_DIR / "snx_daily_state.json"
+LOG_DIR = BASE_DIR / "logs"
+LOG_DIR.mkdir(exist_ok=True)
+
+load_dotenv(str(ENV_FILE), override=True)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# LOGGING — Activity log + Trade CSV + Candle CSV (audit)
+# ═══════════════════════════════════════════════════════════════════════════
+
+_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+_activity_file = LOG_DIR / f"snx_activity_{_ts}.log"
+_trade_csv = LOG_DIR / f"snx_trades_{datetime.now().strftime('%Y%m%d')}.csv"
+_candle_csv = LOG_DIR / f"snx_candles_{datetime.now().strftime('%Y%m%d')}.csv"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-7s | %(message)s",
+    datefmt="%H:%M:%S",
+    handlers=[logging.FileHandler(str(_activity_file), encoding="utf-8"),
+              logging.StreamHandler()]
+)
+log = logging.getLogger("SNX")
+
+
+class TradeLogger:
+    """One row per lot exit — full audit trail."""
+    HEADERS = ["date", "time", "trade_id", "leg", "strike", "lot",
+               "signal_time", "signal_high", "signal_low", "signal_close",
+               "signal_vwap", "atr_frozen", "trigger_E", "fill_price",
+               "exit_price", "qty", "pnl_points", "pnl_value", "exit_reason",
+               "rung_reached", "hold_seconds", "entry_order_id", "exit_order_id"]
+
+    def __init__(self):
+        self.path = _trade_csv
+        if not self.path.exists():
+            with open(self.path, "w", newline="") as f:
+                csv.writer(f).writerow(self.HEADERS)
+
+    def log_exit(self, **kw):
+        try:
+            with open(self.path, "a", newline="") as f:
+                csv.writer(f).writerow([kw.get(h, "") for h in self.HEADERS])
+        except Exception as e:
+            log.error(f"Trade log write error: {e}")
+
+
+class CandleLogger:
+    """Every closed 2-min candle with its VWAP/ATR — for chart reconciliation."""
+    HEADERS = ["date", "time", "leg", "sec_id", "open", "high", "low", "close",
+               "candle_vol", "cum_vol", "vwap", "atr", "state", "eligible"]
+
+    def __init__(self):
+        self.path = _candle_csv
+        if not self.path.exists():
+            with open(self.path, "w", newline="") as f:
+                csv.writer(f).writerow(self.HEADERS)
+
+    def log(self, **kw):
+        try:
+            with open(self.path, "a", newline="") as f:
+                csv.writer(f).writerow([kw.get(h, "") for h in self.HEADERS])
+        except Exception:
+            pass
+
+
+trade_logger = TradeLogger()
+candle_logger = CandleLogger()
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CREDENTIALS  (identical flow to RA17)
+# ═══════════════════════════════════════════════════════════════════════════
+
+DHAN_CLIENT_ID = os.getenv("DHAN_CLIENT_ID", "").strip()
+DHAN_PIN = os.getenv("DHAN_PIN", "").strip()
+DHAN_TOTP_SECRET = os.getenv("DHAN_TOTP_SECRET", "").strip()
+DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN", "").strip()
+
+HEADERS: Dict[str, str] = {}
+WS_URL: str = ""
+
+BASE_URL = "https://api.dhan.co/v2"
+IST = timezone(timedelta(hours=5, minutes=30))
+
+# requests accepts (connect, read). Bounding the CONNECT leg separately matters
+# because Python tries each resolved address in turn with the FULL timeout —
+# unlike curl, which races IPv4 and IPv6 in parallel. api.dhan.co advertises 8
+# IPv6 addresses, so with a dead IPv6 route and a 20s timeout, a single call
+# stalls 160s before it ever reaches IPv4. That is measured, not theoretical.
+CONNECT_TIMEOUT = 5.0
+
+# ═══════════════════════════════════════════════════════════════════════════
+# HTTP TRANSPORT
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Two things matter here and both were learned the hard way.
+#
+# 1. CONNECTION REUSE. A bare requests.post() opens a fresh TCP connection and
+#    a fresh TLS handshake for every call. The strategy polls every few seconds
+#    all session, so that cost is paid hundreds of times for no reason. A
+#    Session with keep-alive pays it once.
+#
+# 2. IPv6. If the host resolves to an IPv6 address whose route is broken, the
+#    OS sits in connect() until it times out before falling back to IPv4. The
+#    symptom is a call that takes 80-160 seconds and then succeeds, which looks
+#    like a slow API but is nothing of the sort. Setting DHAN_FORCE_IPV4=1 in
+#    .env makes urllib3 resolve A records only, skipping the dead path.
+
+def force_ipv4(enabled: bool = True):
+    """Make urllib3 resolve IPv4 only. See note above."""
+    try:
+        import urllib3.util.connection as u3c
+        u3c.allowed_gai_family = (lambda: socket.AF_INET) if enabled else \
+            (lambda: socket.AF_UNSPEC)
+        return True
+    except Exception as e:
+        log.warning(f"Could not set IPv4-only mode: {e}")
+        return False
+
+
+def auto_select_ip_family(host="api.dhan.co", port=443, budget=2.0) -> str:
+    """
+    Decide once, at start-up, whether IPv6 is usable.
+
+    Measured on a real machine: api.dhan.co advertises 8 IPv6 addresses, the
+    route to them was dead, and Python tries each in turn with the FULL socket
+    timeout — 8 x 20s = 160s per call, versus 0.03s over IPv4. curl hides this
+    because it races both families (Happy Eyeballs); Python does not.
+
+    The client runs a packaged EXE and will never edit a .env file, so this
+    cannot depend on someone remembering a flag. One probe, 2s budget, once.
+
+      DHAN_FORCE_IPV4=1  force IPv4, skip the probe
+      DHAN_FORCE_IPV4=0  never force, skip the probe
+      unset              probe and decide
+    """
+    v = os.getenv("DHAN_FORCE_IPV4", "").strip().lower()
+    if v in ("1", "true", "yes"):
+        force_ipv4(True)
+        log.info("DHAN_FORCE_IPV4=1 — resolving IPv4 only")
+        return "forced"
+    if v in ("0", "false", "no"):
+        log.info("DHAN_FORCE_IPV4=0 — auto-detection disabled")
+        return "disabled"
+
+    try:
+        infos = socket.getaddrinfo(host, port, socket.AF_INET6, socket.SOCK_STREAM)
+    except Exception:
+        return "no-ipv6"                      # nothing to stall on
+    if not infos:
+        return "no-ipv6"
+
+    af, st_, proto, _, sa = infos[0]
+    sock = None
+    t0 = time.time()
+    try:
+        sock = socket.socket(af, st_, proto)
+        sock.settimeout(budget)
+        sock.connect(sa)
+        log.info(f"IPv6 reachable in {time.time() - t0:.2f}s — leaving it enabled")
+        return "ipv6-ok"
+    except Exception:
+        force_ipv4(True)
+        log.warning(f"IPv6 to {host} did not answer within {budget:.0f}s "
+                    f"({len(infos)} address(es) advertised). Forcing IPv4 — "
+                    f"without this every call would stall behind each dead "
+                    f"address in turn.")
+        return "auto-ipv4"
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+# Two sessions, deliberately.
+#
+# A pooled connection that the server has quietly closed produces
+# RemoteDisconnected('Remote end closed connection without response') on the
+# next request. Seen twice on 08-Sep, once blocking a poll for 1249 seconds.
+# The cure is to let urllib3 retry a request that died on a stale socket.
+#
+# But that must NEVER apply to order placement: a POST /orders that appears to
+# fail may in fact have reached the exchange, and retrying it could double the
+# position. So reads retry and writes do not, and they cannot be confused
+# because they are different objects.
+from urllib3.util.retry import Retry
+
+_read_retry = Retry(total=3, connect=3, read=2, status=0, backoff_factor=0.4,
+                    allowed_methods=frozenset(["GET", "POST"]),
+                    raise_on_status=False)
+
+# RA17 never hit this problem because it never pools — a bare requests.post()
+# opens a fresh socket every call, so no socket can go stale. That is not a fix
+# worth copying (it pays a TCP+TLS handshake on every poll), but it is a useful
+# fallback: DHAN_NO_POOL=1 turns pooling off entirely and reverts to that
+# behaviour if pooling ever misbehaves again.
+_NO_POOL = os.getenv("DHAN_NO_POOL", "").strip().lower() in ("1", "true", "yes")
+
+SESSION = requests.Session()          # read-only: quotes, charts, chains
+SESSION.mount("https://", requests.adapters.HTTPAdapter(
+    pool_connections=1 if _NO_POOL else 4,
+    pool_maxsize=1 if _NO_POOL else 8,
+    max_retries=_read_retry))
+if _NO_POOL:
+    SESSION.headers["Connection"] = "close"
+    log.info("DHAN_NO_POOL set — connection reuse disabled")
+
+ORDER_SESSION = requests.Session()    # orders: never retried automatically
+ORDER_SESSION.mount("https://", requests.adapters.HTTPAdapter(
+    pool_connections=2, pool_maxsize=4, max_retries=0))
+
+
+class RateGate:
+    def __init__(self, max_per_sec: float):
+        self.min_gap = 1.0 / max_per_sec
+        self._last = 0.0
+        self._lock = threading.Lock()
+
+    def wait(self):
+        with self._lock:
+            gap = time.time() - self._last
+            if gap < self.min_gap:
+                time.sleep(self.min_gap - gap)
+            self._last = time.time()
+
+
+DATA_GATE = RateGate(4.0)
+ORDER_GATE = RateGate(8.0)
+OC_GATE = RateGate(0.30)
+
+
+class DhanTokenManager:
+    def verify(self, token: str) -> bool:
+        if not token: return False
+        try:
+            h = {"access-token": token, "client-id": DHAN_CLIENT_ID}
+            return SESSION.get(f"{BASE_URL}/profile", headers=h,
+                               timeout=(CONNECT_TIMEOUT, 10)).status_code == 200
+        except Exception:
+            return False
+
+    def renew(self, token: str) -> Optional[str]:
+        try:
+            h = {"access-token": token, "dhanClientId": DHAN_CLIENT_ID,
+                 "Content-Type": "application/json"}
+            d = SESSION.get(f"{BASE_URL}/RenewToken", headers=h, timeout=15).json()
+            if "accessToken" in d:
+                log.info("Token renewed")
+                return d["accessToken"]
+            log.warning(f"Renew failed: {d}")
+        except Exception as e:
+            log.warning(f"Renew error: {e}")
+        return None
+
+    def generate(self, max_retries=3) -> Optional[str]:
+        url = "https://auth.dhan.co/app/generateAccessToken"
+        for attempt in range(max_retries):
+            rem = 30 - (int(time.time()) % 30)
+            if attempt > 0 or rem < 10:
+                log.info(f"  Waiting {rem+1}s for TOTP window...")
+                time.sleep(rem + 1)
+            totp = pyotp.TOTP(DHAN_TOTP_SECRET).now()
+            log.info(f"Attempt {attempt+1}: TOTP={totp}")
+            try:
+                params = {"dhanClientId": DHAN_CLIENT_ID, "pin": DHAN_PIN, "totp": totp}
+                d = SESSION.post(url, params=params, timeout=15).json()
+                if "accessToken" in d:
+                    log.info("Token generated")
+                    return d["accessToken"]
+                log.warning(f"Generate attempt {attempt+1} failed: {d.get('errorMessage', d)}")
+            except Exception as e:
+                log.warning(f"Generate error: {e}")
+        return None
+
+    def ensure_token(self) -> str:
+        if DHAN_ACCESS_TOKEN:
+            log.info("Verifying existing token...")
+            if self.verify(DHAN_ACCESS_TOKEN): return DHAN_ACCESS_TOKEN
+            log.info("Token invalid, trying renew...")
+            t = self.renew(DHAN_ACCESS_TOKEN)
+            if t:
+                self._save(t); return t
+            log.info("Renew failed, generating via TOTP...")
+        else:
+            log.info("No existing token, generating via TOTP...")
+        t = self.generate()
+        if not t: raise RuntimeError("Could not obtain Dhan token")
+        self._save(t); return t
+
+    def _save(self, token):
+        try: set_key(str(ENV_FILE), "DHAN_ACCESS_TOKEN", token)
+        except Exception: pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MID-SESSION RE-AUTHENTICATION
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# 17-Sep: the token was verified fine at 08:50 and expired at 09:24, twenty-six
+# minutes into the session. Every poll after that returned HTTP 401 DH-901.
+# 907 identical errors, no candles, no signals — and no way for the app to say
+# it had gone blind. The client restarted at 09:51 and it worked immediately,
+# because startup re-authenticates.
+#
+# The token manager already knows how to recover (verify -> renew -> TOTP). It
+# simply only ran at startup. Now any 401 triggers it in place.
+
+_AUTH_LOCK = threading.Lock()
+_LAST_REAUTH = 0.0
+REAUTH_COOLDOWN = 40.0          # a TOTP window is 30s; do not hammer it
+WS_NEEDS_RECONNECT = threading.Event()
+AUTH_FAILED = threading.Event()
+
+
+def reauthenticate(reason: str = "") -> bool:
+    """
+    Get a fresh token mid-session and rewire everything that holds one.
+
+    Returns True if the token changed. Serialised and rate-limited, because
+    every poll that 401s will call this and the TOTP window is 30 seconds.
+    """
+    global _LAST_REAUTH, DHAN_ACCESS_TOKEN
+    with _AUTH_LOCK:
+        if time.time() - _LAST_REAUTH < REAUTH_COOLDOWN:
+            return False            # another thread just did it
+        _LAST_REAUTH = time.time()
+        log.warning(f"  TOKEN REJECTED ({reason}) — re-authenticating in place")
+        try:
+            token = DhanTokenManager().ensure_token()
+        except Exception as e:
+            AUTH_FAILED.set()
+            log.error(f"  Re-authentication FAILED: {e}. The app cannot fetch "
+                      f"candles until this is resolved.")
+            return False
+        DHAN_ACCESS_TOKEN = token
+        HEADERS.update({"Content-Type": "application/json",
+                        "access-token": token, "client-id": DHAN_CLIENT_ID})
+        # The websocket URL embeds the token, so the existing socket is now
+        # running on a dead credential and has to be rebuilt too.
+        globals()["WS_URL"] = (f"wss://api-feed.dhan.co?version=2"
+                               f"&token={token}&clientId={DHAN_CLIENT_ID}"
+                               f"&authType=2")
+        WS_NEEDS_RECONNECT.set()
+        AUTH_FAILED.clear()
+        log.info("  Re-authenticated. New token in use; websocket will reconnect.")
+        return True
+
+
+def set_credentials(cid, pin, totp, token=""):
+    global DHAN_CLIENT_ID, DHAN_PIN, DHAN_TOTP_SECRET, DHAN_ACCESS_TOKEN
+    DHAN_CLIENT_ID = cid; DHAN_PIN = pin
+    DHAN_TOTP_SECRET = totp; DHAN_ACCESS_TOKEN = token
+
+
+def init_credentials(status_cb=None):
+    global HEADERS, WS_URL, DHAN_ACCESS_TOKEN
+    auto_select_ip_family()
+    log.info("Authenticating with Dhan...")
+    if status_cb: status_cb("Authenticating with Dhan...")
+    token = DhanTokenManager().ensure_token()
+    DHAN_ACCESS_TOKEN = token
+    HEADERS.update({"Content-Type": "application/json",
+                    "access-token": token, "client-id": DHAN_CLIENT_ID})
+    WS_URL = (f"wss://api-feed.dhan.co?version=2"
+              f"&token={token}&clientId={DHAN_CLIENT_ID}&authType=2")
+    log.info("Credentials initialized. WS URL ready.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# INDEX CONFIG
+# ═══════════════════════════════════════════════════════════════════════════
+
+SENSEX = {"security_id": "51", "segment": "BSE_FNO", "idx_segment": "IDX_I",
+          "strike_gap": 100, "lot_size": 20}
+
+MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# INSTRUMENT MASTER
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# 21-Oct: the master was fetched at 09:15:01 and finished at 09:19:09. The
+# strategy was blind for the first four minutes of the session.
+#
+# Two separate mistakes, both introduced with the security-id lot-size fix:
+#
+#   TIMING  lot size now resolves after the legs, so the fetch moved from the
+#           pre-open wait (where four minutes costs nothing) to just after the
+#           open (where it costs everything). The master does not depend on
+#           the strike, so there was never a reason for it to wait.
+#
+#   COST    the previous code streamed the CSV and stopped at the first match.
+#           Mine downloaded all 19 MB and built 211,969 dictionaries first.
+#
+# So: start the download in the background the moment the engine starts, and
+# index only what is actually needed while the bytes arrive.
+
+LOT_MEMO = BASE_DIR / "last_lot_size.json"
+
+_MASTER = {
+    "by_id": {},        # security id -> (lot, symbol, expiry)
+    "by_expiry": [],    # (symbol, expiry, lot) for the fallback tally
+    "ready": threading.Event(),
+    "started": False,
+    "error": None,
+    "rows": 0,
+    "seconds": 0.0,
+}
+_MASTER_LOCK = threading.Lock()
+MASTER_UNDERLYINGS = ("SENSEX", "BANKEX")
+
+
+def _index_master_stream(resp) -> None:
+    """Build the lookup while the bytes arrive, holding only what we need."""
+    import csv as csvmod
+    lines = (ln.decode("utf-8", errors="ignore")
+             for ln in resp.iter_lines() if ln)
+    reader = csvmod.reader(lines)
+    header = next(reader)
+    header = [h.lstrip("\ufeff").strip() for h in header]
+    ix = {name: i for i, name in enumerate(header)}
+    need = ("SEM_SMST_SECURITY_ID", "SEM_TRADING_SYMBOL",
+            "SEM_INSTRUMENT_NAME", "SEM_LOT_UNITS", "SEM_EXPIRY_DATE")
+    missing = [c for c in need if c not in ix]
+    if missing:
+        raise ValueError(f"instrument master is missing columns: {missing}")
+    ID, SYM, INS, LOT, EXP = (ix[c] for c in need)
+
+    by_id, by_exp, n = {}, [], 0
+    for row in reader:
+        n += 1
+        if len(row) <= EXP or row[INS] != "OPTIDX":
+            continue
+        sym = row[SYM].strip().upper()
+        if not sym.startswith(MASTER_UNDERLYINGS):
+            continue
+        try:
+            lot = int(float(row[LOT]))
+        except (ValueError, TypeError):
+            continue
+        if lot <= 0:
+            continue
+        exp = row[EXP].strip()[:10]
+        by_id[row[ID].strip()] = (lot, row[SYM].strip(), exp)
+        by_exp.append((sym, exp, lot))
+
+    _MASTER["by_id"] = by_id
+    _MASTER["by_expiry"] = by_exp
+    _MASTER["rows"] = n
+
+
+def _fetch_master_now():
+    t0 = time.time()
+    try:
+        with SESSION.get(MASTER_URL, stream=True, timeout=180) as r:
+            r.raise_for_status()
+            _index_master_stream(r)
+        _MASTER["error"] = None
+        _MASTER["seconds"] = time.time() - t0
+        log.info(f"  Instrument master indexed: {len(_MASTER['by_id']):,} "
+                 f"contracts from {_MASTER['rows']:,} rows "
+                 f"in {_MASTER['seconds']:.0f}s")
+    except Exception as e:
+        _MASTER["error"] = str(e)
+        log.error(f"  Instrument master failed after "
+                  f"{time.time() - t0:.0f}s: {e}")
+    finally:
+        _MASTER["ready"].set()
+
+
+def prefetch_scrip_master():
+    """
+    Start downloading the master in the background, now.
+
+    Called at start-up, long before the strike is known, so the cost lands in
+    the pre-open wait instead of the first minutes of the session.
+    """
+    with _MASTER_LOCK:
+        if _MASTER["started"]:
+            return
+        _MASTER["started"] = True
+    log.info("  Fetching instrument master in the background...")
+    threading.Thread(target=_fetch_master_now, daemon=True,
+                     name="scrip-master").start()
+
+
+def _ensure_master(timeout: float = 240.0) -> bool:
+    """Block until the master is indexed. Starts it if nobody has."""
+    if not _MASTER["started"]:
+        prefetch_scrip_master()
+    if not _MASTER["ready"].is_set():
+        log.info("  Waiting for the instrument master to finish...")
+    if not _MASTER["ready"].wait(timeout):
+        log.error(f"  Instrument master did not arrive within {timeout:.0f}s")
+        return False
+    if _MASTER["error"]:
+        return False
+    return bool(_MASTER["by_id"])
+
+
+def _refresh_master():
+    """Force a re-download; only used if a security id is missing."""
+    with _MASTER_LOCK:
+        _MASTER["started"] = True
+        _MASTER["ready"].clear()
+    _fetch_master_now()
+
+
+def lot_size_for_security(sec_ids: List[str]) -> Optional[int]:
+    """
+    Read the lot size of the exact contracts being traded.
+
+    The original lookup took the FIRST OPTIDX row whose symbol STARTED WITH
+    "SENSEX". That also matches SENSEX50, and "first row" depends on however
+    Dhan ordered the CSV that morning. It gave 20 for five sessions and then
+    75 on 09-Oct-2026, where 20 was correct — every P&L that day was 3.75x
+    too large, and live it would have sent 225 quantity instead of 60.
+
+    The strike differs every morning, so nothing is cached across sessions.
+    By the time this runs the option chain has already given us the exact
+    security IDs of today's legs, so they are matched exactly. Lot size is a
+    property of the underlying and expiry rather than the strike, so the legs
+    must agree; if they do not, the lookup is wrong and stopping beats sizing
+    on a guess.
+    """
+    if not _ensure_master():
+        return None
+
+    found = {}
+    missing = []
+    for sid in sec_ids:
+        hit = _MASTER["by_id"].get(str(sid))
+        if not hit:
+            missing.append(str(sid))
+            continue
+        found[str(sid)] = hit
+
+    if missing and not found:
+        # A contract listed after our copy was taken. Worth one retry.
+        log.warning(f"  {len(missing)} security id(s) absent — refreshing the "
+                    f"instrument master once.")
+        _refresh_master()
+        for sid in missing:
+            hit = _MASTER["by_id"].get(str(sid))
+            if hit:
+                found[str(sid)] = hit
+
+    for sid in sec_ids:
+        if str(sid) not in found:
+            log.warning(f"  Security {sid} is not in the instrument master")
+
+    if not found:
+        return None
+
+    for sid, (lot, sym, exp) in found.items():
+        log.info(f"    {sym or sid}  (secId {sid})  expiry {exp}  lot = {lot}")
+    lots = {v[0] for v in found.values()}
+    if len(lots) > 1:
+        log.error(f"  The two legs report DIFFERENT lot sizes {sorted(lots)}. "
+                  f"That is impossible for one underlying and expiry, so the "
+                  f"lookup is wrong. Refusing to trade.")
+        return None
+    return lots.pop()
+
+
+def lot_size_by_expiry(expiry: str, underlying: str = "SENSEX") -> Optional[int]:
+    """
+    Fallback for when a security id is missing, which can happen on a freshly
+    listed contract.
+
+    Takes the MOST COMMON lot size across that underlying and expiry, so one
+    stray row cannot swing the answer the way "first match" did. SENSEX50 is
+    excluded explicitly — sharing a prefix is what caused the original fault.
+    """
+    if not _ensure_master():
+        return None
+
+    from collections import Counter
+    tally = Counter()
+    want = underlying.upper()
+    for sym, exp, lot in _MASTER["by_expiry"]:
+        if not sym.startswith(want):
+            continue
+        tail = sym[len(want):]
+        if tail[:1].isdigit():
+            continue                      # SENSEX50 and friends
+        if expiry and exp and exp != expiry:
+            continue
+        tally[lot] += 1
+    if not tally:
+        return None
+    lot, n = tally.most_common(1)[0]
+    if len(tally) > 1:
+        log.warning(f"  Mixed lot sizes for {underlying} {expiry}: "
+                    f"{dict(tally)} — taking the most common ({lot})")
+    log.info(f"  {underlying} {expiry} lot size = {lot} (from {n} contracts)")
+    return lot
+
+
+def _load_last_lot_size() -> Optional[int]:
+    """
+    The previous session's lot size, so a change can be called out.
+
+    The exception handling is deliberately narrow. A broad `except Exception`
+    here once hid a NameError — LOT_MEMO had been deleted by an unrelated edit
+    and the lot-size-change warning was silently dead for a build, because a
+    missing file and a missing variable looked identical.
+    """
+    try:
+        import json as _j
+        return int(_j.loads(LOT_MEMO.read_text()).get("lot_size", 0)) or None
+    except (FileNotFoundError, ValueError, KeyError, TypeError):
+        return None
+    except Exception as e:
+        log.warning(f"  Could not read the lot-size memo: {type(e).__name__}: {e}")
+        return None
+
+
+def _save_last_lot_size(lot: int):
+    try:
+        import json as _j
+        LOT_MEMO.write_text(_j.dumps({"lot_size": int(lot),
+                                      "date": now_ist().strftime("%Y-%m-%d")}))
+    except OSError as e:
+        log.warning(f"  Could not write the lot-size memo: {e}")
+    except Exception as e:
+        log.warning(f"  Lot-size memo error: {type(e).__name__}: {e}")
+
+
+def fetch_sensex_lot_size() -> Optional[int]:
+    """Kept for the offline tools; the engine uses the security-id lookup."""
+    return lot_size_by_expiry(get_nearest_expiry() or "")
+
+
+def now_ist(): return datetime.now(IST)
+
+
+def _normalize_epoch(ts):
+    """
+    REST timestamps. Dhan v2 returns TRUE UNIX epoch — verified against the
+    sample values in their own historical-data docs, where a daily candle
+    lands exactly on 00:00 IST and consecutive candles show a three-day gap
+    across a weekend. So there is nothing to normalise: pass it through.
+
+    This used to carry a heuristic inherited from an earlier project:
+    "if the timestamp is 4.5-6.5 hours ahead of now, subtract 5:30". That
+    silently rewrote any bar falling in that window. A closed bar is never in
+    the future, so production was safe — but it made a 14:45 bar decode as
+    09:15 when the clock happened to read 09:50, which is how it was found.
+    Guessing at a convention we have since verified is not worth the risk.
+    """
+    return int(ts)
+
+
+def ws_epoch(ts):
+    """
+    WebSocket last-traded-time. This one genuinely may arrive shifted, and
+    unlike the REST feed it has not been verified, so the heuristic stays —
+    but scoped to the websocket path alone, where it cannot touch candle
+    construction in REST mode.
+    """
+    ts = int(ts)
+    now_ts = int(time.time())
+    if int(4.5 * 3600) <= (ts - now_ts) <= int(6.5 * 3600):
+        ts -= 19800
+    return ts
+
+
+def epoch_to_ist(ts, fmt="%H:%M:%S"):
+    if not ts: return "-"
+    return datetime.fromtimestamp(_normalize_epoch(int(ts)), tz=IST).strftime(fmt)
+
+
+def session_anchor_epoch(dt: Optional[datetime] = None) -> int:
+    """
+    Epoch of 09:15:00 IST for the given date.
+
+    CRITICAL: 2-minute candles must be anchored to the session open, not to
+    epoch % 120. 09:15 IST is NOT on a 120-second epoch boundary, so a naive
+    modulo bucket would straddle the open and every candle would be offset by
+    one minute against the broker's chart.
+    """
+    d = (dt or now_ist()).astimezone(IST)
+    return int(d.replace(hour=9, minute=15, second=0, microsecond=0).timestamp())
+
+
+def bucket_of(ts: int, interval: int = 120) -> int:
+    """Session-anchored bucket index for an epoch timestamp."""
+    ts = _normalize_epoch(int(ts))
+    anchor = session_anchor_epoch(datetime.fromtimestamp(ts, tz=IST))
+    return (ts - anchor) // interval
+
+
+def bucket_start_epoch(ts: int, interval: int = 120) -> int:
+    ts = _normalize_epoch(int(ts))
+    anchor = session_anchor_epoch(datetime.fromtimestamp(ts, tz=IST))
+    return anchor + ((ts - anchor) // interval) * interval
+
+
+def hhmm(s: str):
+    return datetime.strptime(s, "%H:%M").time()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# REST API  (order engine lifted from RA17)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _hdrs():
+    return {"Content-Type": "application/json",
+            "access-token": HEADERS.get("access-token", ""),
+            "client-id": HEADERS.get("client-id", "")}
+
+
+SLOW_CALL_SECONDS = 3.0     # anything above this is worth knowing about
+
+
+_ERR_SEEN = {}
+
+
+def _log_api_error(endpoint: str, code: int, body: str):
+    """One line a minute per endpoint+code, with a count of what it hid."""
+    key = (endpoint, code)
+    now = time.time()
+    last, hidden = _ERR_SEEN.get(key, (0.0, 0))
+    if now - last > 60:
+        extra = f"  ({hidden} identical suppressed)" if hidden else ""
+        log.error(f"  API {endpoint} -> HTTP {code}: {body[:160]}{extra}")
+        _ERR_SEEN[key] = (now, 0)
+    else:
+        _ERR_SEEN[key] = (last, hidden + 1)
+
+
+def api_post(endpoint, payload, retries=2, timeout=15):
+    """
+    POST with rate gating, retries, and timing.
+
+    Dhan allows 5 requests/second on Data APIs and 1 per 3 seconds on the
+    option chain; the gates above enforce that. What the gates cannot protect
+    against is the API simply being slow, which matters enormously here — the
+    strategy acts on a candle close and the order lives for one candle, so a
+    call that takes 30 seconds is not a slow call, it is a missed trade. Every
+    call is therefore timed and anything sluggish is logged.
+    """
+    if "optionchain" in endpoint: OC_GATE.wait()
+    else: DATA_GATE.wait()
+    for att in range(retries + 1):
+        t0 = time.time()
+        try:
+            r = SESSION.post(f"{BASE_URL}{endpoint}", headers=_hdrs(),
+                              json=payload,
+                              timeout=(CONNECT_TIMEOUT, timeout))
+            dt = time.time() - t0
+            if dt > SLOW_CALL_SECONDS:
+                log.warning(f"  SLOW API {endpoint} took {dt:.1f}s "
+                            f"(HTTP {r.status_code})")
+            if r.status_code == 200: return r.json()
+            if r.status_code == 429:
+                log.warning(f"  API {endpoint} rate limited, backing off")
+                time.sleep(2 ** (att + 1)); continue
+            body = r.text or ""
+            if (r.status_code in (401, 403) or "DH-901" in body
+                    or "DH-906" in body):
+                if reauthenticate(f"HTTP {r.status_code} on {endpoint}"):
+                    continue        # retry straight away with the new token
+                _log_api_error(endpoint, r.status_code, body)
+                time.sleep(2.0)
+                continue
+            _log_api_error(endpoint, r.status_code, body)
+            if att < retries: time.sleep(1.5)
+        except requests.exceptions.Timeout:
+            log.error(f"  API {endpoint} TIMED OUT after {timeout}s "
+                      f"(attempt {att + 1}/{retries + 1})")
+            if att < retries: time.sleep(1.5)
+        except Exception as e:
+            log.error(f"  API {endpoint} error after {time.time() - t0:.1f}s: {e}")
+            if att < retries: time.sleep(1.5)
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ORDERS
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# 13-Nov, live: the IOC attempts missed, the market fallback was sent, and four
+# seconds later the engine declared "Entry order failed — leg stands down."
+# The order had been accepted. It filled. The client was left holding a real
+# position the engine knew nothing about — no stop, no ladder, no square-off.
+# It happened twice in eight minutes.
+#
+# Three faults, all in the same place:
+#
+#   * the fallback used validity DAY, so an unfilled order rests at the
+#     exchange instead of dying
+#   * polling gave up after 4s and returned filled=False WITHOUT cancelling
+#   * polling only looked at averageTradedPrice, never orderStatus, so a
+#     reported fill with a lagging average price was invisible
+#
+# The rule now: only a CONFIRMED rejection or cancellation is a failure.
+# Anything else is UNKNOWN, and unknown is resolved against the broker's
+# positions before the strategy is allowed to move on.
+
+TERMINAL_DEAD = ("REJECTED", "CANCELLED", "EXPIRED")
+TERMINAL_FILLED = ("TRADED", "EXECUTED", "COMPLETE", "FILLED")
+
+
+def _order_status(oid: str) -> dict:
+    """(status, average price, filled quantity) for one order."""
+    if not oid:
+        return {"status": "", "avg": 0.0, "qty": 0}
+    try:
+        ORDER_GATE.wait()
+        r = ORDER_SESSION.get(f"{BASE_URL}/orders/{oid}", headers=_hdrs(),
+                              timeout=10)
+        if r.status_code != 200:
+            return {"status": "", "avg": 0.0, "qty": 0}
+        d = r.json()
+        if isinstance(d, list):
+            d = d[0] if d else {}
+        return {"status": str(d.get("orderStatus", "")).upper(),
+                "avg": float(d.get("averageTradedPrice", 0) or 0),
+                "qty": int(float(d.get("filledQty",
+                                       d.get("filled_qty", 0)) or 0))}
+    except Exception:
+        return {"status": "", "avg": 0.0, "qty": 0}
+
+
+def _await_order(oid: str, seconds: float = 30.0) -> dict:
+    """
+    Wait for an order to reach a terminal state.
+
+    A market order deserves far more than the four seconds it used to get, and
+    a fill counts the moment the status says so — the average price often
+    arrives a beat later.
+    """
+    deadline = time.time() + seconds
+    last = {"status": "", "avg": 0.0, "qty": 0}
+    while time.time() < deadline:
+        st = _order_status(oid)
+        if st["status"]:
+            last = st
+            if st["status"] in TERMINAL_FILLED:
+                return {"filled": True, "price": st["avg"], "qty": st["qty"],
+                        "order_id": oid, "status": st["status"]}
+            if st["status"] in TERMINAL_DEAD:
+                return {"filled": False, "price": 0.0, "qty": 0,
+                        "order_id": oid, "status": st["status"]}
+        time.sleep(0.5)
+    # Never say "failed" here. We simply do not know.
+    return {"filled": False, "price": last["avg"], "qty": last["qty"],
+            "order_id": oid, "status": "UNKNOWN"}
+
+
+def broker_position(security_id: str) -> dict:
+    """
+    What the BROKER thinks we hold. The only authority that matters.
+
+    Used to resolve an order whose outcome we could not confirm, and to find
+    positions the engine has no record of at all.
+    """
+    try:
+        ORDER_GATE.wait()
+        r = ORDER_SESSION.get(f"{BASE_URL}/positions", headers=_hdrs(),
+                              timeout=15)
+        if r.status_code != 200:
+            log.error(f"  [POSITIONS] HTTP {r.status_code}: {r.text[:160]}")
+            return {"qty": 0, "avg": 0.0, "found": False}
+        for p in (r.json() or []):
+            if str(p.get("securityId", "")) != str(security_id):
+                continue
+            net = int(float(p.get("netQty", 0) or 0))
+            if net == 0:
+                continue
+            avg = float(p.get("buyAvg", 0) or p.get("costPrice", 0) or 0)
+            return {"qty": net, "avg": avg, "found": True}
+        return {"qty": 0, "avg": 0.0, "found": True}
+    except Exception as e:
+        log.error(f"  [POSITIONS] error: {e}")
+        return {"qty": 0, "avg": 0.0, "found": False}
+
+
+def place_order_limit_ioc(security_id, segment, side, qty, price,
+                          price_buffer=0.10, max_retries=3) -> dict:
+    """
+    LIMIT+IOC attempts, then a MARKET fallback that is also IOC.
+
+    IOC on the fallback is deliberate: the order either fills immediately or
+    dies at the exchange. The previous DAY validity left an unfilled market
+    order resting while the engine walked away from it.
+    """
+    for att in range(max_retries):
+        ORDER_GATE.wait()
+        adj = round(price + price_buffer * (1 if side == "BUY" else -1), 2)
+        pl = {"dhanClientId": str(DHAN_CLIENT_ID), "transactionType": side,
+              "exchangeSegment": segment, "productType": "INTRADAY",
+              "orderType": "LIMIT", "validity": "IOC",
+              "securityId": str(security_id), "quantity": int(qty),
+              "disclosedQuantity": 0, "price": adj,
+              "triggerPrice": 0, "afterMarketOrder": False}
+        log.info(f"  [ORDER] {side} {segment}:{security_id} qty={qty} "
+                 f"LIMIT@{adj} (att {att+1}/{max_retries})")
+        try:
+            r = ORDER_SESSION.post(f"{BASE_URL}/orders", headers=_hdrs(),
+                                   json=pl, timeout=15)
+            if r.status_code == 200:
+                d = r.json()
+                oid = str(d.get("orderId", ""))
+                status = str(d.get("orderStatus", "")).upper()
+                avg = float(d.get("averageTradedPrice", 0) or 0)
+                if status in TERMINAL_FILLED:
+                    log.info(f"  [FILLED] {side} qty={qty} @ Rs.{avg:.2f} id={oid}")
+                    return {"filled": True, "price": avg, "qty": int(qty),
+                            "order_id": oid, "status": status}
+                if status in TERMINAL_DEAD:
+                    err = (d.get("omsErrorDescription")
+                           or d.get("errorMessage") or status)
+                    log.warning(f"  [REJECTED] {err} id={oid}")
+                    break
+                if oid:
+                    # IOC: it resolves within a second or two either way.
+                    res = _await_order(oid, seconds=5.0)
+                    if res["filled"]:
+                        log.info(f"  [FILLED] {side} qty={res['qty'] or qty} "
+                                 f"@ Rs.{res['price']:.2f}")
+                        return res
+                    if res["status"] == "UNKNOWN":
+                        # Do not retry on top of an order we cannot account
+                        # for — that is how you end up long twice.
+                        log.error(f"  [UNRESOLVED] IOC order {oid} did not "
+                                  f"reach a terminal state. Stopping here "
+                                  f"rather than placing another.")
+                        return res
+            else:
+                log.error(f"  [ORDER] HTTP {r.status_code}: {r.text[:200]}")
+                if "DH-905" in (r.text or ""):
+                    log.error("  [ORDER] DH-905 Invalid IP — this is an account "
+                              "configuration fault, not a transient one. The "
+                              "machine's public IP must be whitelisted against "
+                              "this API key. Retrying cannot help.")
+                    return {"filled": False, "price": 0.0, "qty": 0,
+                            "order_id": "", "status": "IP_NOT_WHITELISTED"}
+        except Exception as e:
+            log.error(f"  [ORDER] Error: {e}")
+        price_buffer += 0.10
+        time.sleep(0.5)
+
+    log.warning(f"  [FALLBACK] {side} {segment}:{security_id} -> MARKET (IOC)")
+    return place_order_market(security_id, segment, side, qty)
+
+
+def place_order_market(security_id, segment, side, qty) -> dict:
+    """
+    MARKET + IOC. Fills now or dies now — it never rests at the exchange.
+
+    If the outcome cannot be confirmed, this returns status UNKNOWN. The
+    caller MUST resolve that against the broker's positions. Returning a bare
+    filled=False here is what left a live position unmanaged on 13-Nov.
+    """
+    ORDER_GATE.wait()
+    pl = {"dhanClientId": str(DHAN_CLIENT_ID), "transactionType": side,
+          "exchangeSegment": segment, "productType": "INTRADAY",
+          "orderType": "MARKET", "validity": "IOC",
+          "securityId": str(security_id), "quantity": int(qty),
+          "disclosedQuantity": 0, "price": 0, "triggerPrice": 0,
+          "afterMarketOrder": False}
+    try:
+        r = ORDER_SESSION.post(f"{BASE_URL}/orders", headers=_hdrs(),
+                               json=pl, timeout=15)
+        if r.status_code != 200:
+            log.error(f"  [MKT ORDER] HTTP {r.status_code}: {r.text[:200]}")
+            if "DH-905" in (r.text or ""):
+                return {"filled": False, "price": 0.0, "qty": 0,
+                        "order_id": "", "status": "IP_NOT_WHITELISTED"}
+            return {"filled": False, "price": 0.0, "qty": 0,
+                    "order_id": "", "status": "HTTP_ERROR"}
+        d = r.json()
+        oid = str(d.get("orderId", ""))
+        status = str(d.get("orderStatus", "")).upper()
+        avg = float(d.get("averageTradedPrice", 0) or 0)
+        if status in TERMINAL_FILLED and avg > 0:
+            log.info(f"  [MKT FILLED] {side} qty={qty} @ Rs.{avg:.2f}")
+            return {"filled": True, "price": avg, "qty": int(qty),
+                    "order_id": oid, "status": status}
+        res = _await_order(oid, seconds=30.0)
+        if res["filled"]:
+            log.info(f"  [MKT FILLED] {side} qty={res['qty'] or qty} "
+                     f"@ Rs.{res['price']:.2f}")
+        elif res["status"] == "UNKNOWN":
+            log.error(f"  [MKT UNRESOLVED] order {oid} gave no terminal status "
+                      f"in 30s. The caller must check the broker's positions "
+                      f"before assuming anything.")
+        return res
+    except Exception as e:
+        log.error(f"  [MKT ORDER] Error: {e}")
+        return {"filled": False, "price": 0.0, "qty": 0,
+                "order_id": "", "status": "EXCEPTION"}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DATA FETCH
+# ═══════════════════════════════════════════════════════════════════════════
+
+def fetch_expiry_list() -> List[str]:
+    payload = {"UnderlyingScrip": int(SENSEX["security_id"]), "UnderlyingSeg": "IDX_I"}
+    resp = api_post("/optionchain/expirylist", payload)
+    if resp and resp.get("status") == "success":
+        return resp.get("data", [])
+    log.error(f"  Expiry API failed: {resp}")
+    return []
+
+
+def get_nearest_expiry() -> Optional[str]:
+    """Nearest available SENSEX weekly expiry — resolved at runtime (spec 2.1)."""
+    exps = fetch_expiry_list()
+    if not exps: return None
+    today = now_ist().date()
+    future = sorted([(datetime.strptime(e, "%Y-%m-%d").date(), e) for e in exps
+                     if datetime.strptime(e, "%Y-%m-%d").date() >= today])
+    if future:
+        log.info(f"  Expiries available: {[e for _, e in future[:4]]}")
+        return future[0][1]
+    return None
+
+
+def fetch_option_chain(expiry: str) -> Optional[dict]:
+    payload = {"UnderlyingScrip": int(SENSEX["security_id"]),
+               "UnderlyingSeg": "IDX_I", "Expiry": expiry}
+    resp = api_post("/optionchain", payload)
+    if resp and resp.get("status") == "success":
+        return {"spot_price": float(resp["data"]["last_price"]), "oc": resp["data"]["oc"]}
+    return None
+
+
+def fetch_intraday_1m(security_id, segment, instrument, days=6) -> List[dict]:
+    """
+    Dhan intraday charts support 1/5/15/25/60-minute intervals — there is no
+    native 2-minute. We pull 1-minute and aggregate (see aggregate_2m).
+    """
+    to_d = now_ist().strftime("%Y-%m-%d")
+    fr_d = (now_ist() - timedelta(days=days)).strftime("%Y-%m-%d")
+    payload = {"securityId": str(security_id), "exchangeSegment": segment,
+               "instrument": instrument, "interval": "1",
+               "fromDate": fr_d, "toDate": to_d}
+    # Short timeout on purpose: a candle that arrives very late is useless to
+    # the strategy, so failing fast and retrying next poll beats blocking.
+    resp = api_post("/charts/intraday", payload, retries=1, timeout=12)
+    if not resp or "open" not in resp: return []
+    n = len(resp["open"])
+    tss = resp.get("timestamp", [0] * n)
+    vols = resp.get("volume", [0] * n)
+    out = []
+    for i in range(n):
+        out.append({"ts": int(tss[i]) if i < len(tss) else 0,
+                    "open": float(resp["open"][i]), "high": float(resp["high"][i]),
+                    "low": float(resp["low"][i]), "close": float(resp["close"][i]),
+                    "volume": float(vols[i]) if i < len(vols) else 0.0})
+    return out
+
+
+def aggregate_tf(candles_1m: List[dict], minutes: int = 2,
+                 mode: str = "count") -> List[dict]:
+    """
+    Roll Dhan's 1-minute bars into `minutes`-minute bars.
+
+    Always built from 1-minute source, at every timeframe — even 5 and 15
+    where Dhan has a native interval. One code path, and it is the one
+    reconciled against the chart. A native 5-minute bar and a rollup of five
+    1-minute bars disagree whenever a minute is missing, and carrying both
+    would mean verifying both.
+
+    mode="count" groups every `minutes` SURVIVING bars, which is what ChartIQ
+    (and so the broker's chart) does — gaps are collapsed, not preserved.
+    """
+    return aggregate(candles_1m, period=int(minutes), mode=mode,
+                     anchor_of=lambda ts: session_anchor_epoch(
+                         datetime.fromtimestamp(_normalize_epoch(ts), tz=IST)))
+
+
+def aggregate_2m(candles_1m: List[dict], mode: str = "count") -> List[dict]:
+    """Back-compat shim for the reconciliation tools."""
+    return aggregate_tf(candles_1m, 2, mode)
+
+
+def get_sensex_open_0915() -> Optional[float]:
+    """
+    The 09:15 opening index level — the strike reference (spec 2.2).
+    Read from the index's own 1-minute history so a late start still resolves
+    the same strike the strategy would have chosen at the open.
+    """
+    candles = fetch_intraday_1m(SENSEX["security_id"], "IDX_I", "INDEX", days=2)
+    if not candles: return None
+    today = now_ist().date()
+    anchor = session_anchor_epoch()
+    for c in candles:
+        ts = _normalize_epoch(c["ts"])
+        if ts == anchor:
+            return float(c["open"])
+    todays = [c for c in candles
+              if datetime.fromtimestamp(_normalize_epoch(c["ts"]), tz=IST).date() == today]
+    if todays:
+        todays.sort(key=lambda x: _normalize_epoch(x["ts"]))
+        return float(todays[0]["open"])
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# WS BINARY PARSERS
+# ═══════════════════════════════════════════════════════════════════════════
+
+EXCH_SEG_MAP = {0: "IDX_I", 1: "NSE_EQ", 2: "NSE_FNO", 3: "NSE_CUR",
+                4: "BSE_EQ", 5: "MCX_COMM", 7: "BSE_CUR", 8: "BSE_FNO"}
+
+
+def parse_header(msg):
+    if len(msg) < 8: return None
+    return {"resp_code": msg[0], "seg": EXCH_SEG_MAP.get(msg[3], str(msg[3])),
+            "security_id": str(struct.unpack_from("<I", msg, 4)[0]), "payload": msg[8:]}
+
+
+def parse_ticker(payload):
+    """Response code 2 — LTP + LTT (16-byte packet)."""
+    if len(payload) < 8: return None
+    return {"ltp": float(struct.unpack_from("<f", payload, 0)[0]),
+            "ltt": int(struct.unpack_from("<I", payload, 4)[0])}
+
+
+def parse_quote(payload):
+    """
+    Response code 4 — Quote packet (50 bytes total, 42-byte payload).
+
+    Layout after the 8-byte header:
+      0  float32  LTP
+      4  int16    last traded quantity
+      6  int32    last trade time
+      10 float32  average traded price
+      14 int32    volume (cumulative for the day)
+      18 int32    total sell quantity
+      22 int32    total buy quantity
+      26 float32  day open
+      30 float32  day close
+      34 float32  day high
+      38 float32  day low
+
+    VWAP needs traded volume, which the ticker packet does not carry — this is
+    why the option legs subscribe in Quote mode (RequestCode 17) rather than
+    Ticker mode. The layout above must be verified against a live feed before
+    go-live; the engine logs the first few parsed packets for that purpose.
+    """
+    if len(payload) < 42: return None
+    return {"ltp": float(struct.unpack_from("<f", payload, 0)[0]),
+            "ltq": int(struct.unpack_from("<h", payload, 4)[0]),
+            "ltt": int(struct.unpack_from("<I", payload, 6)[0]),
+            "atp": float(struct.unpack_from("<f", payload, 10)[0]),
+            "volume": int(struct.unpack_from("<I", payload, 14)[0]),
+            "day_open": float(struct.unpack_from("<f", payload, 26)[0]),
+            "day_high": float(struct.unpack_from("<f", payload, 34)[0]),
+            "day_low": float(struct.unpack_from("<f", payload, 38)[0])}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CANDLE ENGINE — session-anchored 2-minute
+# ═══════════════════════════════════════════════════════════════════════════
+
+class CandleEngine:
+    def __init__(self, sec_id, label, interval=120, on_close=None,
+                 opening_cum_vol: float = 0.0):
+        self.sec_id = sec_id; self.label = label; self.interval = interval
+        self.on_close = on_close
+        self.lock = threading.Lock()
+        self.current: Optional[dict] = None
+        self.last_ltp: Optional[float] = None
+        self.last_cum_vol: float = float(opening_cum_vol)
+        # Cumulative day volume as at the close of the previous completed bar.
+        # This is the ONLY place cumulative-vs-per-bar volume is reconciled;
+        # every candle leaving this class carries a per-bar "volume".
+        self._cum_at_prev_close: float = float(opening_cum_vol)
+        self.ticks = 0
+
+    def on_tick(self, ltp, ltt, cum_vol=None):
+        ltp = float(ltp); ltt = ws_epoch(int(ltt))
+        b = bucket_start_epoch(ltt, self.interval)
+        completed = None
+        with self.lock:
+            self.last_ltp = ltp; self.ticks += 1
+            if cum_vol is not None:
+                self.last_cum_vol = float(cum_vol)
+            if self.current is None:
+                self.current = {"ts": b, "open": ltp, "high": ltp, "low": ltp,
+                                "close": ltp, "cum_vol": self.last_cum_vol}
+                return
+            if b == self.current["ts"]:
+                self.current["high"] = max(self.current["high"], ltp)
+                self.current["low"] = min(self.current["low"], ltp)
+                self.current["close"] = ltp
+                self.current["cum_vol"] = self.last_cum_vol
+                return
+            if b > self.current["ts"]:
+                completed = dict(self.current)
+                completed["volume"] = max(
+                    0.0, completed["cum_vol"] - self._cum_at_prev_close)
+                self._cum_at_prev_close = completed["cum_vol"]
+                self.current = {"ts": b, "open": ltp, "high": ltp, "low": ltp,
+                                "close": ltp, "cum_vol": self.last_cum_vol}
+        if completed is not None and self.on_close:
+            self.on_close(self.sec_id, completed)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# INDICATORS
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CONFIG & STATE
+# ═══════════════════════════════════════════════════════════════════════════
+
+class LegState(Enum):
+    IDLE = "IDLE"                # eligible, waiting for a close above VWAP
+    ARMED = "ARMED"              # order resting, valid for one candle
+    IN_TRADE = "IN_TRADE"
+    STOOD_DOWN = "STOOD_DOWN"    # attempt spent, waiting for a close below VWAP
+    HALTED = "HALTED"
+
+
+@dataclass
+class StrategyConfig:
+    paper_mode: bool = True
+    entry_buffer: float = 0.20        # above signal candle high
+    stop_buffer: float = 1.00         # below signal candle low
+    atr_period: int = 14
+    vwap_field: str = "ohlc4"         # must match the label on his chart
+    # Locked: these were reconciled against the chart and are no longer
+    # exposed in the GUI. Still overridable from the console runner.
+    agg_mode: str = "count"           # "count" = ChartIQ/Kite | "clock"
+    data_source: str = "rest"         # "rest" (verified path) | "websocket"
+    rest_poll: float = 4.0            # seconds between REST polls
+    rest_grace: float = 6.0           # declare a bar closed this long after
+    ws_silence_seconds: float = 90.0  # force a reconnect after this much quiet
+    open_countdown_seconds: float = 120.0   # how often to report the wait
+    reconcile_seconds: float = 180.0  # how often to check broker vs engine
+    max_signal_age: float = 0.0       # 0 = derive from the timeframe
+
+    # ─── derived ───
+
+    @property
+    def lots(self) -> int:
+        """Lots actually traded. The multiplier keeps this divisible by 3."""
+        return max(3, int(self.lot_multiplier) * 3)
+
+    @property
+    def tf_seconds(self) -> int:
+        return int(self.timeframe_minutes) * 60
+
+    @property
+    def signal_age_limit(self) -> float:
+        """
+        How stale a bar may be and still arm a trigger.
+
+        Was a flat 90s, chosen because a 2-minute order window is 120s. That
+        is useless on a 1-minute chart (90s is most of a candle) and needlessly
+        strict on 15-minute. Scale it: a quarter of the timeframe, never below
+        20s.
+        """
+        if self.max_signal_age > 0:
+            return self.max_signal_age
+        return max(20.0, self.tf_seconds * 0.25)
+
+    @property
+    def seed_days(self) -> int:
+        """
+        Days of 1-minute history to request.
+
+        Wilder needs roughly 300 BARS to converge, and a bar is timeframe
+        minutes long. At 15 minutes that is 4,500 trading minutes — about
+        twelve sessions. Ten days is plenty at 2 minutes and nowhere near
+        enough at 15, so scale the request.
+        """
+        bars_needed = max(300, self.atr_seed_bars)
+        minutes = bars_needed * self.timeframe_minutes
+        sessions = minutes / 375.0          # 09:15-15:30
+        return max(10, int(sessions * 1.6) + 2)   # weekends and holidays
+    atr_method: str = "wilder"        # "wilder" (ChartIQ Math) | "sma"
+    rung_atr_mult: float = 2.0        # Tn = E + 2*ATR*n
+    cost_plus: float = 2.00           # stop after T1 = E + 2
+    timeframe_minutes: int = 2        # 1, 2, 3, 5, 10 or 15
+    lot_multiplier: int = 1           # actual lots = multiplier x 3
+    last_entry: str = "14:45"
+    square_off: str = "15:00"
+    atr_seed_bars: int = 300          # Wilder needs ~200 bars to converge
+    min_premium: float = 0.0          # 0 = disabled (open item)
+    daily_loss_limit: float = 0.0     # 0 = disabled (open item)
+    first_candle_can_signal: bool = True   # open item — spec 12.3 item 5
+    max_slippage: float = 0.0         # 0 = disabled; else skip fill beyond E+x
+
+
+@dataclass
+class Position:
+    leg: str
+    sec_id: str
+    strike: int
+    trade_id: str
+    E: float                 # trigger price — the reference for the whole ladder
+    fill_price: float
+    atr_frozen: float
+    stop: float
+    initial_stop: float
+    lots_open: int
+    lot_size: int
+    lots_at_entry: int = 0
+    highest_rung: int = 0
+    opened_at: float = field(default_factory=time.time)
+    entry_order_id: str = ""
+    realised: float = 0.0
+    signal: dict = field(default_factory=dict)
+
+    def rung_price(self, n: int, mult: float) -> float:
+        return self.E + mult * self.atr_frozen * n
+
+
+@dataclass
+class Leg:
+    name: str                 # "CE" / "PE"
+    sec_id: str = ""
+    strike: int = 0
+    label: str = ""
+    state: LegState = LegState.IDLE
+    eligible: bool = True
+    vwap: SessionVWAP = field(default_factory=SessionVWAP)
+    atr: WilderATR = field(default_factory=WilderATR)
+    seed_bars: int = 0
+    seed_residual: float = 1.0
+    ltp: float = 0.0
+    last_candle: Optional[dict] = None
+    signal_candle: Optional[dict] = None
+    trigger: float = 0.0
+    pending_stop: float = 0.0
+    armed_bucket: int = -1
+    position: Optional[Position] = None
+    pnl: float = 0.0
+    trades: int = 0
+    attempts: int = 0
+    atr_ok: bool = False
+    order_in_flight: bool = False
+    candles_seen: int = 0
+    seeded_upto: int = 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ENGINE
+# ═══════════════════════════════════════════════════════════════════════════
+
+class SensexVWAPLadderEngine:
+    VERSION = "1.0"
+
+    def __init__(self, config: Optional[StrategyConfig] = None, gui_callback=None):
+        self.config = config or StrategyConfig()
+        self.gui_cb = gui_callback or (lambda *a: None)
+        self.stop_event = threading.Event()
+
+        self.expiry: Optional[str] = None
+        self.strike: int = 0
+        self.sensex_open: float = 0.0
+        self.spot: float = 0.0
+        self.lot_size: int = SENSEX["lot_size"]
+
+        self.legs: Dict[str, Leg] = {"CE": Leg("CE"), "PE": Leg("PE")}
+        self.by_sec: Dict[str, Leg] = {}
+
+        self.candle_engines: Dict[str, CandleEngine] = {}
+        self.rest_feed: Optional[RestCandleFeed] = None
+        self.ws = None
+        self.ws_connected = threading.Event()
+
+        self.trade_lock = threading.Lock()
+        self.closed: List[dict] = []
+        self.packet_count = 0
+        self.last_tick_at = 0.0
+        self._loss_halting = False
+        self._quote_debug = 0
+        self._halted = False
+        self._trade_seq = 0
+
+    # ─── events ───
+
+    def _emit(self, event, data=None):
+        try: self.gui_cb(event, data or {})
+        except Exception: pass
+
+    # ─── initialise ───
+
+    def initialize(self) -> bool:
+        self._emit("status", {"msg": "Initializing..."})
+
+        # Start the instrument master downloading NOW, in the background. The
+        # lot size is not needed until after the 09:15 open, but the download
+        # has nothing to do with the strike — so it belongs in the pre-open
+        # wait, not in the first minutes of the session. On 21-Oct it ran at
+        # 09:15:01 and finished at 09:19:09, four minutes of blindness.
+        prefetch_scrip_master()
+
+        self.expiry = get_nearest_expiry()
+        if not self.expiry:
+            self._emit("error", {"msg": "No SENSEX expiry found"}); return False
+        log.info(f"  Expiry: {self.expiry}")
+
+        self.sensex_open = self._wait_for_session_open()
+        if self.sensex_open <= 0:
+            self._emit("error", {"msg": "Could not resolve the 09:15 SENSEX open"})
+            return False
+
+        self.strike = int(round(self.sensex_open / 100.0) * 100)
+        log.info(f"  SENSEX 09:15 open = {self.sensex_open:.2f} -> strike {self.strike}")
+        oc = fetch_option_chain(self.expiry)
+        if not oc:
+            self._emit("error", {"msg": "Option chain unavailable"}); return False
+        self.spot = oc["spot_price"]
+
+        if not self._resolve_legs(oc["oc"]):
+            return False
+
+        if not self._resolve_lot_size():
+            return False
+
+        self._emit("strike", {"open": self.sensex_open, "strike": self.strike,
+                              "expiry": self.expiry, "lot_size": self.lot_size})
+
+        for name, leg in self.legs.items():
+            self._seed_leg(leg)
+
+        return True
+
+    def reconcile_positions(self, announce: bool = True) -> List[dict]:
+        """
+        Compare what the broker holds against what the engine thinks it holds.
+
+        On 13-Nov a live position existed with no Position object behind it:
+        no stop, no ladder, no square-off, and nothing in the log to say so.
+        The engine should never be the last to know. Runs at start-up and
+        every few minutes while live.
+        """
+        if self.config.paper_mode:
+            return []
+        out = []
+        for name, leg in self.legs.items():
+            if not leg.sec_id:
+                continue
+            bp = broker_position(leg.sec_id)
+            if not bp["found"]:
+                continue
+            held = bp["qty"]
+            ours = leg.position.lots_open * leg.position.lot_size \
+                if leg.position else 0
+            if held == ours:
+                continue
+            out.append({"leg": name, "broker": held, "engine": ours,
+                        "avg": bp["avg"]})
+            if not announce:
+                continue
+            if held > 0 and ours == 0:
+                log.error(f"  MISMATCH [{leg.label}]: the broker holds {held} "
+                          f"qty @ {bp['avg']:.2f} and the engine has NO "
+                          f"position for it. That position is unmanaged — no "
+                          f"stop, no ladder, no square-off.")
+            elif held == 0 and ours > 0:
+                log.error(f"  MISMATCH [{leg.label}]: the engine thinks it "
+                          f"holds {ours} qty but the broker holds none.")
+            else:
+                log.error(f"  MISMATCH [{leg.label}]: broker {held} qty vs "
+                          f"engine {ours} qty.")
+            self._emit("position_mismatch",
+                       {"leg": name, "broker": held, "engine": ours,
+                        "avg": bp["avg"]})
+        return out
+
+    def _reconcile_loop(self):
+        """Keep checking, because a mismatch can appear at any time."""
+        while not self.stop_event.is_set():
+            self.stop_event.wait(self.config.reconcile_seconds)
+            if self.stop_event.is_set() or self.config.paper_mode:
+                continue
+            try:
+                self.reconcile_positions()
+            except Exception as e:
+                log.error(f"  Reconciliation error: {e}")
+
+    def _resolve_lot_size(self) -> bool:
+        """
+        Read the lot size from the exact contracts about to be traded.
+
+        Runs after the legs because it needs their security IDs. The strike
+        differs every morning, so there is nothing to carry over — both IDs
+        are resolved fresh each session and looked up by exact match.
+        """
+        sec_ids = [l.sec_id for l in self.legs.values() if l.sec_id]
+        if not sec_ids:
+            self._emit("error", {"msg": "No legs resolved — cannot read lot size"})
+            return False
+
+        if not _MASTER["ready"].is_set():
+            log.warning("  The instrument master is still downloading — the "
+                        "feed start will wait for it. It should have finished "
+                        "before the open.")
+        log.info("  Reading lot size from today's contracts...")
+        lot = lot_size_for_security(sec_ids)
+        source = "security id"
+        if not lot:
+            log.warning("  Falling back to the expiry-wide lookup.")
+            lot = lot_size_by_expiry(self.expiry)
+            source = f"expiry {self.expiry}"
+
+        if not lot or lot <= 0:
+            self._emit("error", {"msg": "Lot size unavailable — refusing to trade"})
+            log.error("  Could not establish the lot size. Halting rather than "
+                      "assuming one (spec 2.3).")
+            return False
+
+        prev = _load_last_lot_size()
+        if prev and prev != lot:
+            log.warning(f"  LOT SIZE CHANGED since the last session: {prev} -> "
+                        f"{lot}. Position value moves by "
+                        f"{(lot / prev - 1) * 100:+.0f}%. Check this against the "
+                        f"exchange circular before trading.")
+            self._emit("lot_size_changed", {"previous": prev, "now": lot})
+
+        self.lot_size = lot
+        _save_last_lot_size(lot)
+        log.info(f"  SENSEX lot size = {lot}  (from {source}; master took "
+                 f"{_MASTER['seconds']:.0f}s, fetched pre-open)")
+        log.info(f"  {self.config.lots} lots x {lot} = "
+                 f"{self.config.lots * lot} quantity per entry")
+        return True
+
+    def _wait_for_session_open(self, timeout_s: float = 1800.0) -> float:
+        """
+        The strike comes from the 09:15 index open, so it cannot be decided
+        before 09:15. If the app is started early, wait — do not guess.
+
+        On 08-Sep the app was started at 08:54 and fell back to the pre-market
+        spot of 76132.81, choosing strike 76100. The real 09:15 open was
+        75970.28, which is strike 76000. The client traded the wrong pair of
+        options all morning and only discovered it on a restart at 11:38.
+        A wrong strike is not a degraded trade, it is a different instrument.
+
+        Two phases, reported differently because they are different things:
+
+          before 09:15   the market is shut. Count down to the OPEN, not to
+                         the first candle's close — an earlier build counted
+                         to 09:17 while saying "market opens in", which was
+                         wrong by two minutes.
+          from 09:15     the market is open. Dhan publishes the 09:15 candle
+                         while it is still forming, and a candle's OPEN is
+                         fixed the instant it opens, so the strike resolves at
+                         about 09:15:05 rather than waiting until 09:17.
+        """
+        anchor = session_anchor_epoch()          # 09:15:00 today
+
+        val = get_sensex_open_0915()
+        if val and time.time() >= anchor:
+            log.info(f"  SENSEX 09:15 open = {val:.2f}")
+            return val
+
+        deadline = time.time() + timeout_s
+        announced = False
+        last_tick = 0.0
+        while time.time() < deadline and not self.stop_event.is_set():
+            now = time.time()
+
+            # ── phase 1: the market has not opened ──
+            if now < anchor:
+                wait = int(anchor - now)
+                if not announced:
+                    log.info(f"  MARKET NOT OPEN YET. It opens at 09:15 "
+                             f"({wait // 60}m {wait % 60}s away); the strike is "
+                             f"read from that candle. Progress every "
+                             f"{int(self.config.open_countdown_seconds // 60)} min.")
+                    announced = True
+                    last_tick = 0.0
+                if now - last_tick >= self.config.open_countdown_seconds:
+                    last_tick = now
+                    mm = wait // 60
+                    txt = f"{mm}m" if mm else f"{wait}s"
+                    self._emit("waiting_for_open", {"seconds": wait, "text": txt})
+                    self._emit("status", {"msg": f"Market opens in ~{txt}"})
+                    if mm:
+                        log.info(f"  market opens in about {mm} min")
+                self.stop_event.wait(min(5.0, max(0.05, anchor - now)))
+                continue
+
+            # ── phase 2: open, waiting for the candle to appear ──
+            val = get_sensex_open_0915()
+            if val:
+                log.info(f"  SENSEX 09:15 open = {val:.2f}  "
+                         f"(resolved {int(now - anchor)}s after the open)")
+                return val
+            if now - last_tick >= 5.0:
+                last_tick = now
+                self._emit("waiting_for_open",
+                           {"seconds": 0, "text": "reading 09:15 candle"})
+                self._emit("status", {"msg": "Market open — reading the 09:15 candle"})
+            log.info("  09:15 candle not published yet, retrying in 2s...")
+            self.stop_event.wait(2.0)
+
+        log.error("  Gave up waiting for the 09:15 open. Refusing to guess a "
+                  "strike from the pre-market spot.")
+        return 0.0
+
+    def _resolve_legs(self, oc: dict) -> bool:
+        found = 0
+        for sk, sd in oc.items():
+            try: sv = float(sk)
+            except Exception: continue
+            if abs(sv - self.strike) > 0.01: continue
+            for side, key in (("CE", "ce"), ("PE", "pe")):
+                if key not in sd: continue
+                opt = sd[key]
+                leg = self.legs[side]
+                leg.sec_id = str(opt["security_id"])
+                leg.strike = self.strike
+                leg.label = f"SENSEX {self.strike} {side}"
+                leg.ltp = float(opt.get("last_price", 0) or 0)
+                self.by_sec[leg.sec_id] = leg
+                found += 1
+                log.info(f"  {leg.label}: secId={leg.sec_id} LTP=Rs.{leg.ltp:.2f}")
+        if found < 2:
+            self._emit("error", {"msg": f"Strike {self.strike} not fully listed "
+                                        f"({found}/2 legs)"})
+            return False
+        return True
+
+    def _seed_leg(self, leg: Leg):
+        """Seed the continuous ATR from prior-session candles (spec 3.1)."""
+        log.info(f"  Seeding indicators: {leg.label}...")
+        raw = fetch_intraday_1m(leg.sec_id, SENSEX["segment"], "OPTIDX",
+                                days=self.config.seed_days)
+
+        # Dhan serves the minute that is still building. If it survives into
+        # the seed, the last replayed 2-minute bar is built from a half-formed
+        # minute, that wrong value is baked permanently into VWAP and ATR, and
+        # seeded_upto primes the feed PAST it so the correct version never
+        # arrives. Drop it here, before anything is computed.
+        n_raw = len(raw or [])
+        raw = RestCandleFeed.drop_forming(
+            [{**c, "ts": _normalize_epoch(c["ts"])} for c in (raw or [])],
+            time.time())
+        if n_raw - len(raw):
+            log.info(f"  [{leg.label}] excluded {n_raw - len(raw)} still-forming "
+                     f"minute(s) from the seed")
+
+        c2 = aggregate_tf(raw, self.config.timeframe_minutes,
+                          self.config.agg_mode)
+
+        anchor = session_anchor_epoch()
+        prior = [c for c in c2 if c["ts"] < anchor]
+        today = [c for c in c2 if c["ts"] >= anchor]
+
+        leg.vwap = SessionVWAP(self.config.vwap_field)
+        leg.atr = WilderATR(self.config.atr_period, self.config.atr_method)
+
+        if len(prior) < self.config.atr_seed_bars:
+            log.warning(f"  [{leg.label}] Only {len(prior)} prior candles "
+                        f"(need {self.config.atr_seed_bars}). Wilder ATR has "
+                        f"infinite memory, so a short seed will NOT match the "
+                        f"terminal. Falling back to a session-only ATR; this leg "
+                        f"waits for 14 candles before trading (edge case 6b).")
+            leg.atr_ok = False
+        else:
+            leg.atr.seed(prior)          # feed everything we have
+            leg.seed_bars = leg.atr.bars
+            leg.seed_residual = leg.atr.convergence_error()
+            leg.atr_ok = leg.atr.value is not None
+            note = "converged" if leg.seed_residual < 1e-4 else "NOT CONVERGED"
+            log.info(f"    ATR seeded from {leg.seed_bars} prior bars -> "
+                     f"{leg.atr.value:.2f} | seed influence "
+                     f"{leg.seed_residual:.2e} ({note})")
+            self._emit("seeded", {"leg": leg.name, "bars": leg.seed_bars,
+                                  "atr": leg.atr.value,
+                                  "residual": leg.seed_residual})
+            if leg.seed_residual >= 1e-4:
+                log.warning(f"    [{leg.label}] Seed has not converged — ATR may "
+                            f"disagree with the terminal. Pull more history.")
+
+        # Replay any candles already elapsed today so VWAP and state are correct
+        # when the engine is started mid-session.
+        for c in today:
+            self._process_candle(leg, c, replay=True)
+
+        if not leg.atr_ok and leg.atr.value is not None:
+            leg.atr_ok = True
+            log.info(f"  [{leg.label}] Session-only ATR now valid: {leg.atr.value:.2f}")
+
+        if self.config.data_source == "websocket":
+            ce = CandleEngine(leg.sec_id, leg.label, self.config.tf_seconds,
+                              on_close=self._on_candle_close)
+            self.candle_engines[leg.sec_id] = ce
+        leg.seeded_upto = today[-1]["ts"] if today else 0
+        log.info(f"  [{leg.label}] seeded: {len(prior)} prior + {len(today)} today, "
+                 f"ATR={leg.atr.value if leg.atr.value else 0:.2f}, "
+                 f"VWAP={leg.vwap.value if leg.vwap.value else 0:.2f}")
+
+    # ─── candle handling ───
+
+    def _on_rest_bar(self, leg_name: str, bar: dict):
+        leg = self.legs.get(leg_name)
+        if not leg:
+            return
+        try:
+            self._process_candle(leg, bar, replay=False)
+            if leg.candles_seen <= 3 or leg.candles_seen % 30 == 0:
+                log.info(f"  [{leg.label}] live bar "
+                         f"{epoch_to_ist(bar['ts'], '%H:%M')} "
+                         f"O{bar['open']:.2f} H{bar['high']:.2f} "
+                         f"L{bar['low']:.2f} C{bar['close']:.2f} "
+                         f"V{bar.get('volume', 0):.0f} | "
+                         f"VWAP {leg.vwap.value:.2f} ATR {leg.atr.value:.2f}"
+                         if leg.vwap.value and leg.atr.value else "")
+        except Exception as e:
+            log.error(f"  [{leg.label}] REST bar error: {e}")
+
+    def _on_rest_latency(self, leg_name: str, ts: int, lag: float):
+        self._emit("bar_latency", {"leg": leg_name, "lag": lag,
+                                   "time": epoch_to_ist(ts, "%H:%M")})
+
+    def _start_rest_feed(self):
+        legs = {n: l.sec_id for n, l in self.legs.items() if l.sec_id}
+        self.rest_feed = RestCandleFeed(
+            legs=legs,
+            fetch_1m=lambda sec, days=1: fetch_intraday_1m(
+                sec, SENSEX["segment"], "OPTIDX", days=days),
+            aggregate_fn=aggregate,
+            anchor_of=lambda ts: session_anchor_epoch(
+                datetime.fromtimestamp(_normalize_epoch(ts), tz=IST)),
+            on_bar=self._on_rest_bar,
+            on_latency=self._on_rest_latency,
+            on_blind=lambda secs: self._emit("feed_blind", {"seconds": secs}),
+            period=self.config.timeframe_minutes, poll=self.config.rest_poll,
+            grace=self.config.rest_grace, agg_mode=self.config.agg_mode,
+            session_anchor=session_anchor_epoch())
+        for name, leg in self.legs.items():
+            if leg.seeded_upto:
+                self.rest_feed.prime(name, leg.seeded_upto)
+        self.rest_feed.start()
+
+    def _on_candle_close(self, sec_id, candle):
+        leg = self.by_sec.get(sec_id)
+        if not leg: return
+        try:
+            self._process_candle(leg, candle, replay=False)
+        except Exception as e:
+            log.error(f"  [{leg.label}] Candle processing error: {e}")
+
+    def _process_candle(self, leg: Leg, c: dict, replay: bool = False):
+        """
+        Ordering matters and follows spec 7:
+          1. update indicators
+          2. position exits driven by the close (VWAP)
+          3. expire an unfilled armed order
+          4. eligibility reset / new signal
+        """
+        anchor = session_anchor_epoch()
+        if int(c["ts"]) < anchor:
+            # Belt and braces. The feed already filters these, but a bar from a
+            # previous session must never reach VWAP, ATR or the state machine
+            # by any route — on 08-Sep 244 of them did, and every downstream
+            # number was wrong for the rest of the day.
+            if not replay:
+                log.warning(f"  [{leg.label}] ignored a bar from "
+                            f"{epoch_to_ist(c['ts'], '%d-%b %H:%M')} — before "
+                            f"today's session")
+            return
+
+        o, h, l, cl = c["open"], c["high"], c["low"], c["close"]
+        # "volume" is ALWAYS this bar's own traded volume — historical candles
+        # arrive that way from the API, and CandleEngine converts the live
+        # cumulative day total before emitting. Feeding a running total in here
+        # is what produced the VWAP mismatch against the terminal.
+        bar_vol = float(c.get("volume", 0.0))
+
+        vwap = leg.vwap.update(o, h, l, cl, bar_vol)
+        atr = leg.atr.update(h, l, cl)
+        leg.last_candle = c
+        leg.candles_seen += 1
+        if not leg.atr_ok and atr is not None:
+            leg.atr_ok = True
+
+        bkt = bucket_of(c["ts"], self.config.tf_seconds)
+        tstr = epoch_to_ist(c["ts"], "%H:%M")
+
+        if not replay:
+            candle_logger.log(date=now_ist().strftime("%Y-%m-%d"), time=tstr,
+                              leg=leg.name, sec_id=leg.sec_id, open=f"{o:.2f}",
+                              high=f"{h:.2f}", low=f"{l:.2f}", close=f"{cl:.2f}",
+                              candle_vol=f"{bar_vol:.0f}",
+                              cum_vol=f"{c.get('cum_vol', bar_vol):.0f}",
+                              vwap=f"{vwap:.2f}" if vwap else "",
+                              atr=f"{atr:.2f}" if atr else "",
+                              state=leg.state.value, eligible=leg.eligible)
+            self._emit("candle", {"leg": leg.name, "time": tstr, "open": o, "high": h,
+                                  "low": l, "close": cl, "volume": bar_vol,
+                                  "vwap": vwap, "atr": atr,
+                                  "state": leg.state.value, "eligible": leg.eligible})
+
+        if vwap is None:
+            return  # no valid line yet — candle neither signals nor resets
+
+        # ── 2. VWAP exit (unconditional, applies even to the fill candle) ──
+        if leg.position and cl < vwap:
+            if not replay:
+                self._exit_all(leg, cl, "VWAP_CLOSE")
+            else:
+                leg.position = None
+            leg.state = LegState.IDLE
+            leg.eligible = True
+            return
+
+        # ── 3. expire an armed order that never filled ──
+        #
+        # Not while an order is in flight. On 13-Nov the market fallback was
+        # sent at 14:35:00 and this line cancelled the leg at 14:35:01, while
+        # that order was still live at the exchange. The strategy walked away
+        # from an order it had just placed.
+        if (leg.state == LegState.ARMED and bkt > leg.armed_bucket
+                and not leg.order_in_flight):
+            if not replay:
+                log.info(f"  [{leg.label}] Order at {leg.trigger:.2f} not taken "
+                         f"— cancelled. Leg stands down until a close below VWAP.")
+                self._emit("order_cancelled", {"leg": leg.name, "trigger": leg.trigger})
+            leg.state = LegState.STOOD_DOWN
+            leg.signal_candle = None
+            leg.trigger = 0.0
+
+        # ── 4. eligibility / signal ──
+        if cl < vwap:
+            if not leg.eligible and not replay:
+                log.info(f"  [{leg.label}] Close {cl:.2f} < VWAP {vwap:.2f} — RESET, "
+                         f"leg is eligible again")
+            leg.eligible = True
+            if leg.state in (LegState.STOOD_DOWN,):
+                leg.state = LegState.IDLE
+            return
+
+        if cl <= vwap:
+            return  # exactly on the line holds
+
+        # close is strictly above VWAP
+        if leg.position or leg.state in (LegState.ARMED, LegState.HALTED):
+            return
+        if not leg.eligible:
+            return
+        if not leg.atr_ok or leg.atr.value is None:
+            return
+        if self.config.first_candle_can_signal is False and bkt == 0:
+            return
+        if not self._entry_window_open(c["ts"]):
+            return
+
+        # A bar that reached us long after it closed describes a market that
+        # has already moved on. Arming from it would place a trigger at a
+        # stale price, and the very next tick — carrying the CURRENT price —
+        # would fill it instantly at a level that was never available.
+        #
+        # 16-Sep: after a power cut, a bar 407s old fired a signal. It was
+        # cancelled a second later only because the next backlogged bar
+        # arrived immediately. That was luck, not protection.
+        #
+        # Eligibility is NOT consumed: no order was placed, so this was not an
+        # attempt. The leg stays ready for the next genuinely current close.
+        age = float(c.get("lag") or 0.0)
+        if not replay and age > self.config.signal_age_limit:
+            log.warning(f"  [{leg.label}] SIGNAL @ "
+                        f"{epoch_to_ist(c['ts'], '%H:%M')} IGNORED — the bar "
+                        f"arrived {age:.0f}s after it closed, so its high is no "
+                        f"longer a tradeable trigger. Leg stays eligible.")
+            self._emit("stale_signal", {"leg": leg.name, "age": age,
+                                        "time": epoch_to_ist(c["ts"], "%H:%M")})
+            return
+
+        self._arm(leg, c, vwap, replay)
+
+    def _entry_window_open(self, ts) -> bool:
+        """
+        Spec 8: the signal candle must CLOSE at or before 14:45, and the trigger
+        must fill by 14:45. `ts` is the bucket start, so the close is one
+        timeframe later. A candle closing at 14:44 may arm; the order then
+        lives into the next candle but can only fill while the clock is
+        <= 14:45.
+        """
+        close_t = datetime.fromtimestamp(
+            _normalize_epoch(int(ts)) + self.config.tf_seconds, tz=IST).time()
+        return close_t <= hhmm(self.config.last_entry)
+
+    def _fill_window_open(self) -> bool:
+        return now_ist().time() <= hhmm(self.config.last_entry)
+
+    def _arm(self, leg: Leg, c: dict, vwap: float, replay: bool):
+        cfg = self.config
+        trigger = round(c["high"] + cfg.entry_buffer, 2)
+        stop = round(c["low"] - cfg.stop_buffer, 2)
+
+        leg.eligible = False        # spent on PLACEMENT, filled or not
+        leg.attempts += 1
+
+        if cfg.min_premium > 0 and c["close"] < cfg.min_premium:
+            if not replay:
+                log.info(f"  [{leg.label}] Signal suppressed — premium "
+                         f"{c['close']:.2f} below floor {cfg.min_premium:.2f}. "
+                         f"Attempt still consumed (edge case 8).")
+            leg.state = LegState.STOOD_DOWN
+            return
+
+        if trigger - stop < 0.15:
+            if not replay:
+                log.info(f"  [{leg.label}] Signal skipped — stop {stop:.2f} too close "
+                         f"to trigger {trigger:.2f}.")
+            leg.state = LegState.STOOD_DOWN
+            return
+
+        leg.signal_candle = dict(c)
+        leg.signal_candle["vwap"] = vwap
+        leg.signal_candle["atr"] = leg.atr.value
+        leg.trigger = trigger
+        leg.pending_stop = stop
+        leg.armed_bucket = bucket_of(c["ts"], self.config.tf_seconds)
+        leg.state = LegState.ARMED
+
+        if not replay:
+            a = leg.atr.value
+            log.info(f"  [{leg.label}] SIGNAL @ {epoch_to_ist(c['ts'], '%H:%M')} "
+                     f"close={c['close']:.2f} > VWAP={vwap:.2f} | "
+                     f"trigger={trigger:.2f} stop={stop:.2f} ATR={a:.2f} | "
+                     f"T1={trigger + 2*a:.2f} T2={trigger + 4*a:.2f}")
+            self._emit("armed", {"leg": leg.name, "trigger": trigger, "stop": stop,
+                                 "atr": a, "vwap": vwap,
+                                 "t1": trigger + 2 * a, "t2": trigger + 4 * a})
+
+    # ─── tick handling ───
+
+    def _on_tick(self, leg: Leg, ltp: float):
+        leg.ltp = ltp
+        # Mark the book on every tick so the daily limit caps the drawdown
+        # instead of reporting it afterwards.
+        if self.config.daily_loss_limit > 0 and not self._halted:
+            self._check_daily_loss()
+            if self._halted:
+                return
+        if leg.state == LegState.ARMED:
+            if not self._fill_window_open():
+                log.info(f"  [{leg.label}] Past {self.config.last_entry} — resting "
+                         f"order cancelled unfilled.")
+                leg.state = LegState.STOOD_DOWN
+                leg.trigger = 0.0
+                return
+            if ltp >= leg.trigger:
+                self._fill(leg, ltp)
+            return
+        if leg.position:
+            self._manage(leg, ltp)
+
+    def _fill(self, leg: Leg, ltp: float):
+        cfg = self.config
+        if cfg.max_slippage > 0 and ltp > leg.trigger + cfg.max_slippage:
+            log.warning(f"  [{leg.label}] Trigger gapped through "
+                        f"({ltp:.2f} vs {leg.trigger:.2f}) — entry skipped.")
+            leg.state = LegState.STOOD_DOWN
+            return
+
+        qty = cfg.lots * self.lot_size
+        seg = SENSEX["segment"]
+
+        if cfg.paper_mode:
+            fill_price = leg.trigger
+            oid = "PAPER"
+            ok = True
+        else:
+            leg.order_in_flight = True
+            try:
+                res = place_order_limit_ioc(leg.sec_id, seg, "BUY", qty,
+                                            leg.trigger)
+            finally:
+                leg.order_in_flight = False
+            ok = res.get("filled", False)
+            fill_price = res.get("price", 0) or leg.trigger
+            oid = res.get("order_id", "")
+            status = res.get("status", "")
+            filled_qty = int(res.get("qty", 0) or 0)
+
+            if not ok and status == "UNKNOWN":
+                # 13-Nov: this is the case that left a live position
+                # unmanaged. The order was accepted, we could not confirm it
+                # in time, and the engine called it a failure and walked away.
+                # The broker is the only authority on what we hold.
+                log.error(f"  [{leg.label}] Entry outcome UNKNOWN — asking the "
+                          f"broker what we actually hold before continuing.")
+                self._emit("order_unresolved", {"leg": leg.name,
+                                                "order_id": oid})
+                bp = broker_position(leg.sec_id)
+                if not bp["found"]:
+                    self._halt("UNRESOLVED_ORDER")
+                    log.error(f"  [{leg.label}] Could not reach the positions "
+                              f"endpoint either. HALTING. There may be an open "
+                              f"position with no stop — check the terminal NOW.")
+                    self._emit("error", {"msg": "Unresolved order and no "
+                                                "position data — halted. "
+                                                "Check the broker."})
+                    return
+                if bp["qty"] > 0:
+                    filled_qty = bp["qty"]
+                    fill_price = bp["avg"] or leg.trigger
+                    ok = True
+                    log.warning(f"  [{leg.label}] The broker DOES hold "
+                                f"{bp['qty']} qty @ {fill_price:.2f}. Adopting "
+                                f"it so the stop and ladder manage it.")
+                    self._emit("position_adopted",
+                               {"leg": leg.name, "qty": bp["qty"],
+                                "price": fill_price})
+                else:
+                    log.info(f"  [{leg.label}] The broker holds nothing — the "
+                             f"order genuinely did not fill. Standing down.")
+                    leg.state = LegState.STOOD_DOWN
+                    return
+
+            if not ok:
+                if status == "IP_NOT_WHITELISTED":
+                    log.error(f"  [{leg.label}] HALTING: this machine's IP is "
+                              f"not whitelisted for order placement. No order "
+                              f"can succeed until that is fixed in the Dhan "
+                              f"portal.")
+                    self._emit("error", {"msg": "IP not whitelisted — orders "
+                                                "cannot be placed. Halted."})
+                    self._halt("IP_NOT_WHITELISTED")
+                    return
+                log.error(f"  [{leg.label}] Entry order failed ({status}) — "
+                          f"leg stands down.")
+                leg.state = LegState.STOOD_DOWN
+                return
+
+            # A partial fill is a real position, just a smaller one.
+            if filled_qty and filled_qty != qty:
+                lots_got = max(1, filled_qty // self.lot_size)
+                log.warning(f"  [{leg.label}] PARTIAL FILL: {filled_qty} of "
+                            f"{qty} qty ({lots_got} of {cfg.lots} lots). "
+                            f"Managing what we actually hold.")
+                self._emit("partial_fill", {"leg": leg.name, "got": filled_qty,
+                                            "wanted": qty})
+                qty = filled_qty
+
+        self._trade_seq += 1
+        sig = leg.signal_candle or {}
+        pos = Position(
+            leg=leg.name, sec_id=leg.sec_id, strike=leg.strike,
+            trade_id=f"{leg.name}-{self._trade_seq}-{now_ist().strftime('%H%M%S')}",
+            E=leg.trigger,                    # ladder reference = trigger, not fill
+            fill_price=fill_price,
+            atr_frozen=float(sig.get("atr") or leg.atr.value or 0),
+            stop=leg.pending_stop, initial_stop=leg.pending_stop,
+            lots_open=max(1, qty // self.lot_size),
+            lots_at_entry=max(1, qty // self.lot_size),
+            lot_size=self.lot_size,
+            entry_order_id=oid, signal=sig)
+
+        leg.position = pos
+        leg.state = LegState.IN_TRADE
+        leg.trades += 1
+
+        icon = "PAPER" if cfg.paper_mode else "LIVE"
+        third = max(1, cfg.lots // 3)
+        log.info(f"  [{leg.label}] ENTRY ({icon}) {cfg.lots} lots x "
+                 f"{self.lot_size} = {qty} qty @ E={pos.E:.2f} "
+                 f"fill={fill_price:.2f} stop={pos.stop:.2f} "
+                 f"ATR={pos.atr_frozen:.2f} | {third} lots at each of T1, T2, "
+                 f"{cfg.lots - 2 * third} runner")
+        self._emit("entry", {"leg": leg.name, "strike": leg.strike, "E": pos.E,
+                             "fill": fill_price, "stop": pos.stop,
+                             "atr": pos.atr_frozen, "qty": qty,
+                             "paper": cfg.paper_mode})
+
+    def _manage(self, leg: Leg, ltp: float):
+        """Ladder + trailing stop. Price-driven events, evaluated on every tick."""
+        pos = leg.position
+        if not pos: return
+        cfg = self.config
+
+        # Rungs latch: walk up as far as price has reached this tick.
+        # A zero/absent ATR would make every rung equal E and spin forever.
+        n = pos.highest_rung + 1
+        while pos.atr_frozen > 0 and ltp >= pos.rung_price(n, cfg.rung_atr_mult):
+            pos.highest_rung = n
+            if n == 1:
+                self._scale_out(leg, pos.rung_price(1, cfg.rung_atr_mult), "T1")
+                pos.stop = round(pos.E + cfg.cost_plus, 2)
+            elif n == 2:
+                self._scale_out(leg, pos.rung_price(2, cfg.rung_atr_mult), "T2")
+                pos.stop = round(pos.rung_price(1, cfg.rung_atr_mult), 2)
+            else:
+                pos.stop = round(pos.rung_price(n - 1, cfg.rung_atr_mult), 2)
+            log.info(f"  [{leg.label}] T{n} reached @ {pos.rung_price(n, cfg.rung_atr_mult):.2f} "
+                     f"-> stop {pos.stop:.2f}")
+            self._emit("rung", {"leg": leg.name, "rung": n, "stop": pos.stop,
+                                "price": pos.rung_price(n, cfg.rung_atr_mult)})
+            if not leg.position:   # scale-out closed everything
+                return
+            n += 1
+
+        if ltp <= pos.stop:
+            reason = "STOP" if pos.highest_rung == 0 else f"TRAIL_T{pos.highest_rung}"
+            self._exit_all(leg, pos.stop, reason)
+            leg.state = LegState.STOOD_DOWN     # a finished trade spends the attempt
+
+    def _scale_out(self, leg: Leg, price: float, tag: str):
+        """
+        Book one third of the position at this rung.
+
+        The ladder has three parts — T1, T2 and the runner — so a scale-out is
+        always a third of what was opened, not a single lot. The multiplier
+        guarantees the total is divisible by 3, so there is never a remainder:
+
+            3 lots ->  1 at T1,  1 at T2,  1 runner
+            6 lots ->  2 at T1,  2 at T2,  2 runner
+            9 lots ->  3 at T1,  3 at T2,  3 runner
+        """
+        pos = leg.position
+        if not pos:
+            return
+        lots_to_book = max(1, pos.lots_at_entry // 3)
+        if pos.lots_open <= lots_to_book:
+            return              # only the runner is left; it exits on the stop
+        qty = lots_to_book * self.lot_size
+        exit_price = price
+        oid = "PAPER"
+        if not self.config.paper_mode:
+            res = place_order_market(pos.sec_id, SENSEX["segment"], "SELL", qty)
+            if res.get("filled"):
+                exit_price = res["price"]
+            oid = res.get("order_id", "")
+            if not res.get("filled"):
+                log.error(f"  [{leg.label}] {tag} scale-out failed — retrying as full exit")
+                self._exit_all(leg, price, f"{tag}_FAILED")
+                return
+        pnl_pts = exit_price - pos.E
+        pnl_val = pnl_pts * qty
+        pos.lots_open -= lots_to_book
+        pos.realised += pnl_val
+        leg.pnl += pnl_val
+        self._log_lot(leg, pos, exit_price, qty, pnl_pts, pnl_val, tag, oid)
+        word = "lot" if lots_to_book == 1 else "lots"
+        log.info(f"  [{leg.label}] {tag} sold {lots_to_book} {word} "
+                 f"({qty} qty) @ {exit_price:.2f} "
+                 f"PnL=Rs.{pnl_val:+,.0f} ({pos.lots_open} lots left)")
+        self._emit("scale_out", {"leg": leg.name, "tag": tag, "price": exit_price,
+                                 "pnl": pnl_val, "lots_left": pos.lots_open,
+                                 "lots_sold": lots_to_book, "qty": qty})
+
+    def _exit_all(self, leg: Leg, price: float, reason: str):
+        pos = leg.position
+        if not pos: return
+        qty = pos.lots_open * self.lot_size
+        exit_price = price
+        oid = "PAPER"
+        if not self.config.paper_mode and qty > 0:
+            res = place_order_market(pos.sec_id, SENSEX["segment"], "SELL", qty)
+            if res.get("filled"):
+                exit_price = res["price"]
+            oid = res.get("order_id", "")
+        pnl_pts = exit_price - pos.E
+        pnl_val = pnl_pts * qty
+        pos.realised += pnl_val
+        leg.pnl += pnl_val
+        self._log_lot(leg, pos, exit_price, qty, pnl_pts, pnl_val, reason, oid)
+        log.info(f"  [{leg.label}] EXIT {reason} @ {exit_price:.2f} "
+                 f"qty={qty} PnL=Rs.{pnl_val:+,.0f} | trade total Rs.{pos.realised:+,.0f}")
+        self.closed.append({"trade_id": pos.trade_id, "leg": leg.name,
+                            "pnl": pos.realised, "reason": reason})
+        self._emit("trade_closed", {"leg": leg.name, "pnl": pos.realised,
+                                    "reason": reason, "rung": pos.highest_rung,
+                                    "last_leg_pnl": pnl_val,
+                                    "scaled": pos.realised - pnl_val})
+        leg.position = None
+        self._check_daily_loss()
+
+    def _log_lot(self, leg, pos, exit_price, qty, pnl_pts, pnl_val, reason, oid):
+        sig = pos.signal or {}
+        trade_logger.log_exit(
+            date=now_ist().strftime("%Y-%m-%d"), time=now_ist().strftime("%H:%M:%S"),
+            trade_id=pos.trade_id, leg=leg.name, strike=pos.strike,
+            lot=f"{pos.lots_open}", signal_time=epoch_to_ist(sig.get("ts", 0), "%H:%M"),
+            signal_high=f"{sig.get('high', 0):.2f}", signal_low=f"{sig.get('low', 0):.2f}",
+            signal_close=f"{sig.get('close', 0):.2f}",
+            signal_vwap=f"{sig.get('vwap', 0):.2f}", atr_frozen=f"{pos.atr_frozen:.2f}",
+            trigger_E=f"{pos.E:.2f}", fill_price=f"{pos.fill_price:.2f}",
+            exit_price=f"{exit_price:.2f}", qty=qty, pnl_points=f"{pnl_pts:.2f}",
+            pnl_value=f"{pnl_val:.2f}", exit_reason=reason,
+            rung_reached=pos.highest_rung,
+            hold_seconds=int(time.time() - pos.opened_at),
+            entry_order_id=pos.entry_order_id, exit_order_id=oid)
+
+    def day_pnl(self) -> tuple:
+        """(realised, unrealised, total) across both legs, marked to the last tick."""
+        realised = unreal = 0.0
+        for leg in self.legs.values():
+            realised += leg.pnl
+            pos = leg.position
+            if pos and leg.ltp and pos.lots_open:
+                unreal += (leg.ltp - pos.E) * pos.lots_open * pos.lot_size
+        return realised, unreal, realised + unreal
+
+    def _check_daily_loss(self):
+        """
+        Close everything the moment the day's loss reaches the limit.
+
+        The old version summed REALISED P&L only, and ran only after an exit,
+        so it could never stop the trade that breached the limit — only notice
+        afterwards. On 22-Oct the day was -8,921 realised when a trade was
+        opened risking a further 4,110 against 1,079 of remaining budget. It
+        closed at -11,009; had the stop been hit it would have been -13,031.
+
+        Now the total includes open positions marked to the last traded price
+        and is evaluated on every tick, so the limit is a cap on the drawdown
+        rather than a note made after the fact. Breaching it exits every open
+        leg immediately and halts.
+
+        This is a fourth exit reason the strategy spec does not have — it
+        overrides the stop, the VWAP close and the square-off — and it will
+        sometimes close a trade that would have recovered. That is what a hard
+        cap costs, and it was chosen deliberately.
+        """
+        lim = self.config.daily_loss_limit
+        if lim <= 0 or self._halted or self._loss_halting:
+            return
+        realised, unreal, total = self.day_pnl()
+        if total > -abs(lim):
+            return
+
+        self._loss_halting = True
+        try:
+            open_legs = [l for l in self.legs.values()
+                         if l.position and l.position.lots_open]
+            log.error(f"  DAILY LOSS LIMIT hit: Rs.{total:+,.0f} "
+                      f"(booked Rs.{realised:+,.0f}, open Rs.{unreal:+,.0f}) "
+                      f"against a limit of Rs.{abs(lim):,.0f}.")
+            if open_legs:
+                log.error(f"  Closing {len(open_legs)} open position(s) now.")
+            self._emit("daily_loss_hit", {"realised": realised,
+                                          "unrealised": unreal, "total": total,
+                                          "limit": abs(lim),
+                                          "open_legs": len(open_legs)})
+            for leg in open_legs:
+                price = leg.ltp or leg.position.E
+                self._exit_all(leg, price, "DAILY_LOSS")
+            r2, u2, t2 = self.day_pnl()
+            log.error(f"  Day closed at Rs.{t2:+,.0f}. No further trades today.")
+        finally:
+            self._loss_halting = False
+        self._halt("DAILY_LOSS")
+
+    def _halt(self, reason: str):
+        self._halted = True
+        if self.rest_feed:
+            self.rest_feed.stop()
+            log.info(f"  REST feed stopped ({reason})")
+        for leg in self.legs.values():
+            if leg.position:
+                self._exit_all(leg, leg.ltp or leg.position.E, reason)
+            leg.state = LegState.HALTED
+        self._emit("halted", {"reason": reason})
+
+    # ─── square-off ───
+
+    def _check_square_off(self):
+        if self._halted: return
+        if now_ist().time() >= hhmm(self.config.square_off):
+            for leg in self.legs.values():
+                if leg.position:
+                    log.warning(f"  [{leg.label}] 15:00 SQUARE-OFF")
+                    self._exit_all(leg, leg.ltp or leg.position.E, "SQUARE_OFF")
+                leg.state = LegState.HALTED
+            self._halted = True
+            if self.rest_feed:
+                self.rest_feed.stop()
+            log.info(f"  {self.config.square_off} SQUARE-OFF — engine halted, "
+                     f"REST feed stopped. Nothing further will be polled or "
+                     f"traded today.")
+            self._emit("halted", {"reason": "SQUARE_OFF"})
+
+    # ─── websocket ───
+
+    def _subscribe(self, ws):
+        idx = [{"ExchangeSegment": "IDX_I", "SecurityId": SENSEX["security_id"]}]
+        opts = [{"ExchangeSegment": SENSEX["segment"], "SecurityId": l.sec_id}
+                for l in self.legs.values() if l.sec_id]
+
+        if self.config.data_source == "rest":
+            # Candles and volume come from REST, so the feed only has to carry
+            # LTP for the trigger, the stop and the ladder. Ticker mode (15) is
+            # enough, which keeps the unverified quote-packet layout out of the
+            # critical path entirely.
+            ws.send(json.dumps({"RequestCode": 15,
+                                "InstrumentCount": len(idx) + len(opts),
+                                "InstrumentList": idx + opts}))
+            log.info(f"WebSocket subscribed (ticker/LTP only) — "
+                     f"index + {len(opts)} legs. Candles come from REST.")
+        else:
+            ws.send(json.dumps({"RequestCode": 15, "InstrumentCount": len(idx),
+                                "InstrumentList": idx}))
+            # Quote mode (17) carries traded volume, which tick-built VWAP needs.
+            ws.send(json.dumps({"RequestCode": 17, "InstrumentCount": len(opts),
+                                "InstrumentList": opts}))
+            log.info(f"WebSocket subscribed — index (ticker) + "
+                     f"{len(opts)} legs (quote)")
+        self._emit("ws_connected", {"instruments": len(idx) + len(opts),
+                                    "mode": self.config.data_source})
+
+    def _on_ws_open(self, ws):
+        self.ws_connected.set()
+        try:
+            self._subscribe(ws)
+        except Exception as e:
+            log.error(f"Subscribe error: {e}")
+
+    def _on_ws_message(self, ws, msg):
+        if isinstance(msg, str): return
+        hdr = parse_header(bytes(msg))
+        if not hdr: return
+        self.packet_count += 1
+        self.last_tick_at = time.time()
+        sec_id = hdr["security_id"]
+        code = hdr["resp_code"]
+
+        if code == 2:
+            t = parse_ticker(hdr["payload"])
+            if not t: return
+            if sec_id == SENSEX["security_id"]:
+                self.spot = t["ltp"]
+                self._emit("spot_tick", {"spot": t["ltp"]})
+                return
+            leg = self.by_sec.get(sec_id)
+            if leg:
+                ce = self.candle_engines.get(sec_id)
+                if ce:
+                    ce.on_tick(t["ltp"], t["ltt"])
+                # Always drive execution from the tick, whichever source owns
+                # the candles: the trigger, the stop and the rungs need price
+                # resolution finer than a bar.
+                self._on_tick(leg, t["ltp"])
+            return
+
+        if code == 4:
+            q = parse_quote(hdr["payload"])
+            if not q: return
+            leg = self.by_sec.get(sec_id)
+            if not leg: return
+            if self._quote_debug < 3:
+                self._quote_debug += 1
+                log.info(f"  [QUOTE CHECK] {leg.label} ltp={q['ltp']:.2f} "
+                         f"vol={q['volume']} atp={q['atp']:.2f} "
+                         f"ltt={epoch_to_ist(q['ltt'])} — verify against the terminal")
+            ce = self.candle_engines.get(sec_id)
+            if ce: ce.on_tick(q["ltp"], q["ltt"], cum_vol=q["volume"])
+            self._on_tick(leg, q["ltp"])
+            return
+
+    def _on_ws_error(self, ws, error):
+        log.error(f"WS error: {error}")
+
+    def _on_ws_close(self, ws, code, msg):
+        self.ws_connected.clear()
+        log.warning(f"WS closed: {code} {msg}")
+        self._emit("ws_disconnected", {})
+
+    def _ws_watchdog(self):
+        """
+        A websocket can stay 'connected' and deliver nothing.
+
+        On 08-Sep the feed dropped four times with ping/pong timeouts and lost
+        connections. Reconnecting on a visible close is easy; the dangerous
+        case is a socket that is open but silent, because the stop and the
+        ladder run on LTP. If no tick arrives for a while during market hours,
+        force a reconnect rather than trusting the connection.
+        """
+        while not self.stop_event.is_set():
+            self.stop_event.wait(10.0)
+            if self.stop_event.is_set() or self._halted:
+                continue
+            t = now_ist().time()
+            if WS_NEEDS_RECONNECT.is_set():
+                WS_NEEDS_RECONNECT.clear()
+                log.info("  Reconnecting the websocket with the new token.")
+                self.last_tick_at = time.time()
+                try:
+                    if self.ws:
+                        self.ws.close()
+                except Exception:
+                    pass
+                continue
+
+            if not (hhmm("09:15") <= t <= hhmm("15:30")):
+                continue
+            if not self.last_tick_at:
+                continue
+            quiet = time.time() - self.last_tick_at
+            if quiet > self.config.ws_silence_seconds:
+                log.warning(f"  No websocket tick for {quiet:.0f}s during market "
+                            f"hours — forcing a reconnect.")
+                self.last_tick_at = time.time()
+                try:
+                    if self.ws:
+                        self.ws.close()
+                except Exception:
+                    pass
+
+    def _run_ws(self):
+        while not self.stop_event.is_set():
+            try:
+                self.ws = websocket.WebSocketApp(
+                    WS_URL, on_open=self._on_ws_open, on_message=self._on_ws_message,
+                    on_error=self._on_ws_error, on_close=self._on_ws_close)
+                # 20/10 proved too tight on a real connection: four drops in a
+                # session, all client-side ping timeouts. Give the server room.
+                self.ws.run_forever(ping_interval=30, ping_timeout=15)
+            except Exception as e:
+                log.error(f"WS exception: {e}")
+            if not self.stop_event.is_set():
+                log.info("WS reconnecting in 2s...")
+                time.sleep(2)
+
+    # ─── summary ───
+
+    def get_summary(self):
+        """
+        P&L is reported in three parts.
+
+        `leg.pnl` only ever accumulates on a scale-out or an exit, so while a
+        position is open it contributes nothing — the counter sat at zero with
+        a live trade on screen. Unrealised mark-to-market is computed here from
+        the last traded price against the ladder reference E, the same basis
+        the exits use, so realised and unrealised are directly comparable.
+        """
+        legs = []
+        total = 0.0
+        realised_total = 0.0
+        unreal_total = 0.0
+        for name, leg in self.legs.items():
+            pos = leg.position
+            unreal = 0.0
+            if pos and leg.ltp and pos.lots_open:
+                unreal = (leg.ltp - pos.E) * pos.lots_open * pos.lot_size
+            legs.append({
+                "leg": name, "label": leg.label, "strike": leg.strike,
+                "state": leg.state.value, "eligible": leg.eligible,
+                "ltp": leg.ltp, "vwap": leg.vwap.value, "atr": leg.atr.value,
+                "pnl": leg.pnl, "trades": leg.trades, "attempts": leg.attempts,
+                "candles": leg.candles_seen,
+                "realised": leg.pnl, "unrealised": unreal,
+                "open_pnl": leg.pnl + unreal,
+                "trigger": leg.trigger if leg.state == LegState.ARMED else 0,
+                "stop": pos.stop if pos else 0,
+                "lots_open": pos.lots_open if pos else 0,
+                "rung": pos.highest_rung if pos else 0,
+                "E": pos.E if pos else 0,
+            })
+            realised_total += leg.pnl
+            unreal_total += unreal
+            total += leg.pnl + unreal
+        feed = self.rest_feed.health() if self.rest_feed else None
+        return {"legs": legs, "total_pnl": total,
+                "realised_pnl": realised_total, "unrealised_pnl": unreal_total,
+                "spot": self.spot,
+                "feed": feed, "data_source": self.config.data_source,
+                "strike": self.strike, "expiry": self.expiry,
+                "lot_size": self.lot_size, "packets": self.packet_count,
+                "halted": self._halted}
+
+    # ─── run / stop ───
+
+    def run(self):
+        # The mode banner goes in before anything can fail, so that every
+        # activity log opens by answering the first question anyone asks of
+        # it: was this real? On 16-Nov the only evidence of paper mode was
+        # the word "(PAPER)" inside the entry lines, which is no use at all
+        # when a run takes no entries.
+        cap = self.config.daily_loss_limit
+        log.info("=" * 70)
+        if self.config.paper_mode:
+            log.info("  MODE: PAPER — simulated fills. NO ORDERS ARE SENT TO DHAN.")
+        else:
+            log.info("  MODE: LIVE — REAL ORDERS WILL BE PLACED WITH REAL MONEY.")
+        log.info(f"  {self.config.lots} lots | {self.config.timeframe_minutes}m candles"
+                 f" | VWAP {self.config.vwap_field} | ATR({self.config.atr_period})"
+                 f" {self.config.atr_method}")
+        log.info(f"  entry buffer Rs.{self.config.entry_buffer:.2f}"
+                 f" | stop buffer Rs.{self.config.stop_buffer:.2f}"
+                 f" | day loss cap {('Rs.%.0f' % cap) if cap else 'OFF'}"
+                 f" | last entry {self.config.last_entry}"
+                 f" | square off {self.config.square_off}")
+        log.info("=" * 70)
+
+        if not self.initialize():
+            self._emit("error", {"msg": "Initialization failed"})
+            return
+
+        if self.config.data_source == "rest":
+            self._start_rest_feed()
+
+        if not self.config.paper_mode:
+            # Before a single order is placed, find anything already open —
+            # left over from a crash, a restart, or an order the previous
+            # session could not account for.
+            try:
+                stale = self.reconcile_positions()
+                if stale:
+                    log.error(f"  {len(stale)} position mismatch(es) at "
+                              f"start-up. Resolve these before trading.")
+                else:
+                    log.info("  Broker positions match the engine (both flat).")
+            except Exception as e:
+                log.error(f"  Start-up reconciliation failed: {e}")
+            threading.Thread(target=self._reconcile_loop, daemon=True).start()
+
+        threading.Thread(target=self._run_ws, daemon=True).start()
+        threading.Thread(target=self._ws_watchdog, daemon=True).start()
+        self._emit("status", {"msg": "Waiting for WebSocket..."})
+        self.ws_connected.wait(timeout=20)
+        if not self.ws_connected.is_set():
+            self._emit("error", {"msg": "WebSocket failed"}); return
+        # Not "LIVE": in this app that word means real orders and nothing
+        # else, or a paper session reads as a funded one on the status bar.
+        self._emit("status", {"msg": "RUNNING — Monitoring"})
+
+        last_beat = time.time()
+        while not self.stop_event.is_set():
+            try:
+                # This loop ticks once a second. If far more than a second of
+                # wall clock has passed, the process was not running — a power
+                # cut, sleep or hibernate. Say so plainly: on 10-Sep and
+                # 16-Sep this had to be inferred from log lines that were
+                # absent, which is a poor way to learn your machine went off.
+                beat = time.time()
+                gap = beat - last_beat
+                last_beat = beat
+                if gap > 60:
+                    log.error(f"  GAP OF {gap:.0f}s — the application was not "
+                              f"running. Power cut, sleep or hibernate. Bars "
+                              f"from that period will arrive late and will be "
+                              f"ignored for signalling.")
+                    self._emit("suspended", {"seconds": gap})
+
+                self._check_square_off()
+                self._emit("tick_update", self.get_summary())
+                time.sleep(1)
+            except Exception as e:
+                log.error(f"Monitor error: {e}")
+                time.sleep(1)
+
+    def stop(self):
+        self.stop_event.set()
+        if self.rest_feed:
+            h = self.rest_feed.health()
+            if h["bars"]:
+                log.info(f"  REST feed: {h['bars']} bars, avg lag "
+                         f"{h['avg_lag']:.1f}s, max {h['max_lag']:.1f}s "
+                         f"({h['verdict']})")
+                if h.get("late_bars"):
+                    log.warning(f"  {h['late_bars']} bar(s) arrived too late to "
+                                f"be traded on.")
+                if h.get("stalls"):
+                    log.warning(f"  REST feed stalled {h['stalls']} time(s) — "
+                                f"longest {self.rest_feed.last_stall:.0f}s. The "
+                                f"strategy was blind for those periods.")
+                if h.get("dropped_stale"):
+                    log.info(f"  {h['dropped_stale']} bar(s) from a previous "
+                             f"session were correctly ignored.")
+            self.rest_feed.stop()
+        if self.ws:
+            try: self.ws.close()
+            except Exception: pass
+        log.info("Engine stopped")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# STANDALONE
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _console_monitor():
+    """
+    Print the same things the GUI shows, to the terminal.
+
+    Every closed bar, every state change, and a status line each minute. This
+    is the observation surface for a paper session run from VS Code — the log
+    file records everything, but this is what you actually watch.
+    """
+    state = {"last_status": 0.0, "bars": 0}
+
+    def cb(event, d):
+        if event == "candle":
+            state["bars"] += 1
+            v, a = d.get("vwap"), d.get("atr")
+            print(f"  {d['leg']:<3} {d['time']}  "
+                  f"O{d['open']:>8.2f} H{d['high']:>8.2f} L{d['low']:>8.2f} "
+                  f"C{d['close']:>8.2f} V{d.get('volume', 0):>9.0f}  "
+                  f"vwap {v:>8.2f}  atr {a:>6.2f}  "
+                  f"{'ABOVE' if v and d['close'] > v else 'below':<5} "
+                  f"{d.get('state', ''):<10} "
+                  f"{'eligible' if d.get('eligible') else 'spent'}"
+                  if v and a else
+                  f"  {d['leg']:<3} {d['time']}  warming up")
+
+        elif event == "waiting_for_open":
+            print(f"  market opens in ~{d.get('text','?')} "
+                  f"(the strike comes from the 09:15 candle)")
+        elif event == "strike":
+            print(f"\n  09:15 open {d.get('open', 0):.2f} -> strike "
+                  f"{d.get('strike')}   expiry {d.get('expiry')}   "
+                  f"lot {d.get('lot_size')}\n")
+        elif event == "seeded":
+            note = "converged" if d.get("residual", 1) < 1e-4 else "NOT CONVERGED"
+            print(f"  [{d['leg']}] ATR seeded {d['bars']} bars -> "
+                  f"{d.get('atr', 0):.2f}  ({note})")
+        elif event == "ws_connected":
+            print(f"  websocket up — {d.get('instruments')} instruments, "
+                  f"candles from {d.get('mode')}\n")
+            print(f"  {'leg':<4}{'time':<7}{'open':>9}{'high':>9}{'low':>9}"
+                  f"{'close':>9}{'volume':>10}   {'vwap':>8}   {'atr':>6}")
+            print("  " + "-" * 96)
+        elif event == "armed":
+            print(f"\n  >> [{d['leg']}] ARMED  trigger {d['trigger']:.2f}  "
+                  f"stop {d['stop']:.2f}  atr {d['atr']:.2f}  "
+                  f"T1 {d['t1']:.2f}  T2 {d['t2']:.2f}\n")
+        elif event == "order_cancelled":
+            print(f"\n  >> [{d['leg']}] order {d['trigger']:.2f} NOT TAKEN — "
+                  f"leg stands down until a close below VWAP\n")
+        elif event == "entry":
+            print(f"\n  >> [{d['leg']}] ENTRY {'(paper)' if d.get('paper') else 'LIVE'}"
+                  f"  E {d['E']:.2f}  fill {d['fill']:.2f}  qty {d['qty']}  "
+                  f"stop {d['stop']:.2f}\n")
+        elif event == "rung":
+            print(f"     T{d['rung']} at {d['price']:.2f} -> stop {d['stop']:.2f}")
+        elif event == "scale_out":
+            n = d.get("lots_sold", 1)
+            print(f"     {d['tag']} sold {n} lot{'' if n == 1 else 's'} "
+                  f"({d.get('qty', 0)} qty) at {d['price']:.2f}  "
+                  f"these lots {d['pnl']:+,.0f}  ({d['lots_left']} left)")
+        elif event == "trade_closed":
+            sc = d.get("scaled", 0)
+            extra = (f"  = {sc:+,.0f} scaled + {d.get('last_leg_pnl', 0):+,.0f} final"
+                     if abs(sc) > 0.005 else "")
+            print(f"\n  >> [{d['leg']}] CLOSED {d['reason']} at rung T{d['rung']}"
+                  f"  TRADE TOTAL {d['pnl']:+,.0f}{extra}\n")
+        elif event == "position_mismatch":
+            print(f"\n  >> MISMATCH [{d['leg']}] broker={d['broker']} qty "
+                  f"engine={d['engine']} qty — CHECK THE TERMINAL\n")
+        elif event == "order_unresolved":
+            print(f"  >> [{d['leg']}] order {d['order_id']} unconfirmed — "
+                  f"checking broker positions")
+        elif event == "position_adopted":
+            print(f"  >> [{d['leg']}] adopted {d['qty']} qty @ {d['price']:.2f} "
+                  f"from the broker")
+        elif event == "partial_fill":
+            print(f"  >> [{d['leg']}] partial fill {d['got']}/{d['wanted']} qty")
+        elif event == "daily_loss_hit":
+            print(f"\n  >> DAILY LOSS LIMIT {d['limit']:,.0f} reached — day at "
+                  f"{d['total']:+,.0f} (booked {d['realised']:+,.0f}, open "
+                  f"{d['unrealised']:+,.0f}). Closing {d['open_legs']} "
+                  f"position(s) and stopping.\n")
+        elif event == "lot_size_changed":
+            print(f"\n  >> LOT SIZE CHANGED {d['previous']} -> {d['now']} "
+                  f"— verify against the exchange circular\n")
+        elif event == "stale_signal":
+            print(f"  >> [{d['leg']}] signal at {d['time']} ignored — bar was "
+                  f"{d['age']:.0f}s old")
+        elif event == "suspended":
+            print(f"\n  >> app was not running for {d['seconds']:.0f}s "
+                  f"(power cut or sleep)\n")
+        elif event == "halted":
+            print(f"\n  >> HALTED — {d.get('reason')}\n")
+        elif event == "error":
+            print(f"  !! {d.get('msg')}")
+        elif event == "tick_update":
+            now = time.time()
+            if now - state["last_status"] < 60:
+                return
+            state["last_status"] = now
+            f = d.get("feed") or {}
+            lag = (f"lag avg {f['avg_lag']:.1f}s max {f['max_lag']:.1f}s"
+                   if f.get("bars") else "no bars yet")
+            parts = []
+            for lg in d.get("legs", []):
+                parts.append(f"{lg['leg']} {lg['state']:<10} "
+                             f"ltp {lg['ltp']:>8.2f} "
+                             f"vwap {(lg['vwap'] or 0):>8.2f} "
+                             f"{'elig' if lg['eligible'] else 'spent'}")
+            r, u = d.get("realised_pnl", 0), d.get("unrealised_pnl", 0)
+            print(f"  [{now_ist():%H:%M:%S}] spot {d.get('spot', 0):>9.2f}  "
+                  f"pnl {d.get('total_pnl', 0):+,.0f} "
+                  f"(booked {r:+,.0f} / open {u:+,.0f})  {lag}")
+            for pt in parts:
+                print(f"             {pt}")
+    return cb
+
+
+def main():
+    import argparse
+    ap = argparse.ArgumentParser(
+        description="SENSEX VWAP Ladder — console runner (paper by default)")
+    ap.add_argument("--live", action="store_true",
+                    help="place REAL orders. Paper mode is the default.")
+    ap.add_argument("--source", choices=["rest", "websocket"], default="rest",
+                    help="where candles come from")
+    ap.add_argument("--field", default="ohlc4",
+                    choices=["ohlc4", "hlc3", "hl2", "close"])
+    ap.add_argument("--atr-method", choices=["wilder", "sma"], default="wilder")
+    ap.add_argument("--agg", choices=["count", "clock"], default="count")
+    ap.add_argument("--poll", type=float, default=4.0)
+    ap.add_argument("--tf", type=int, default=2,
+                    choices=[1, 2, 3, 5, 10, 15],
+                    help="candle timeframe in minutes")
+    ap.add_argument("--lots", type=int, default=1,
+                    help="multiplier: actual lots = this x 3")
+    args = ap.parse_args()
+
+    if not DHAN_CLIENT_ID or not DHAN_PIN or not DHAN_TOTP_SECRET:
+        raise SystemExit("Missing credentials in .env")
+
+    cfg = StrategyConfig(paper_mode=not args.live, data_source=args.source,
+                         vwap_field=args.field, atr_method=args.atr_method,
+                         agg_mode=args.agg, rest_poll=args.poll,
+                         timeframe_minutes=args.tf,
+                         lot_multiplier=max(1, args.lots))
+
+    print("=" * 100)
+    third = max(1, cfg.lots // 3)
+    print(f"  SENSEX VWAP Ladder — {'LIVE ORDERS' if args.live else 'PAPER'}"
+          f"   {cfg.timeframe_minutes}m candles  vwap={cfg.vwap_field}  "
+          f"atr={cfg.atr_method}  rollup={cfg.agg_mode}")
+    print(f"  {args.lots} x 3 = {cfg.lots} lots   "
+          f"{third} at T1, {third} at T2, {third} runner   "
+          f"stale-signal limit {cfg.signal_age_limit:.0f}s   "
+          f"history {cfg.seed_days}d")
+    print(f"  logs -> {LOG_DIR}")
+    print("=" * 100)
+    if args.live:
+        print("\n  LIVE MODE. Real orders will be placed. Ctrl+C within 5s to abort.")
+        time.sleep(5)
+
+    init_credentials()
+    engine = SensexVWAPLadderEngine(cfg, gui_callback=_console_monitor())
+    try:
+        engine.run()
+    except KeyboardInterrupt:
+        print("\n  stopping...")
+        engine.stop()
+        summary = engine.get_summary()
+        print(f"\n  Day P&L {summary['total_pnl']:+,.0f}")
+        for lg in summary["legs"]:
+            print(f"    {lg['leg']}  {lg['attempts']} attempt(s), "
+                  f"{lg['trades']} filled, pnl {lg['pnl']:+,.0f}")
+        f = summary.get("feed") or {}
+        if f.get("bars"):
+            print(f"    feed: {f['bars']} bars, lag avg {f['avg_lag']:.1f}s "
+                  f"max {f['max_lag']:.1f}s ({f['verdict']})")
+        print(f"\n  logs written to {LOG_DIR}\n")
+
+
+if __name__ == "__main__":
+    main()
